@@ -393,7 +393,7 @@
           <div class="hint" style="margin:4px 0 9px" data-i18n="ext-unzip-hint">
             解压到一个你不会删掉的目录，比如 <code>D:\muse2api-extension</code>。
           </div>
-          <a class="btnlike" href="/admin/extension" download>⬇ 下载 muse2api-extension.zip</a>
+          <a class="btnlike" href="admin/extension" data-app-path="/admin/extension" download>⬇ 下载 muse2api-extension.zip</a>
           <button class="ghost mini" onclick="loadExtFiles()">查看包含哪些文件</button>
           <span class="hint" id="extFiles" style="margin-left:8px"></span>
         </div>
@@ -492,8 +492,8 @@
         <div style="flex:2">
           <label>① 下载脚本</label>
           <div class="copyline">
-            <a class="btnlike ghostlike" href="/admin/cookie-helper?download=1" download>⬇ get_muse_cookie.py</a>
-            <a class="btnlike ghostlike" href="/admin/cookie-helper" target="_blank">查看源码</a>
+            <a class="btnlike ghostlike" href="admin/cookie-helper?download=1" data-app-path="/admin/cookie-helper?download=1" download>⬇ get_muse_cookie.py</a>
+            <a class="btnlike ghostlike" href="admin/cookie-helper" data-app-path="/admin/cookie-helper" target="_blank">查看源码</a>
           </div>
         </div>
         <div style="flex:4;min-width:0">
@@ -1409,10 +1409,17 @@ if (LANG === 'en') {
 
 /* ================= 基础 ================= */
 const $ = id => document.getElementById(id);
+// 管理页可部署在 /、/admin 或反向代理子路径（如 /muse/、/muse/admin）。
+const APP_PATH = location.pathname.replace(/\/admin\/?$/, '').replace(/\/+$/, '');
+const APP_BASE = location.origin + APP_PATH;
+const appUrl = path => APP_PATH + path;
+document.querySelectorAll('a[data-app-path]').forEach(link => {
+  link.href = appUrl(link.dataset.appPath);
+});
 const KEY_STORE = 'muse2api_key';
 let KEY = localStorage.getItem(KEY_STORE) || new URLSearchParams(location.search).get('key') || '';
 $('key').value = KEY;
-$('dBase').textContent = location.origin + '/v1';
+$('dBase').textContent = APP_BASE + '/v1';
 
 /* 登录状态：控制提示条和 Key 输入框高亮 */
 let authOK = null;
@@ -1447,7 +1454,7 @@ async function api(path, opts){
   opts = opts || {};
   opts.headers = Object.assign({'Content-Type':'application/json'}, opts.headers || {});
   if (KEY) opts.headers['Authorization'] = 'Bearer ' + KEY;
-  const r = await fetch(path, opts);
+  const r = await fetch(appUrl(path), opts);
   const txt = await r.text();
   let data; try { data = JSON.parse(txt); } catch(e){ data = null; }
   if (r.status === 401){
@@ -1538,13 +1545,13 @@ async function loadApikey(){
   try{
     const d = await api('/admin/apikey');
     realKey = d.api_key || '';
-    $('inBase').value = d.base_url || (location.origin + '/v1');
+    $('inBase').value = d.base_url || (APP_BASE + '/v1');
     renderKey();
     fillExtFields(d.base_url);
     $('cmdText').textContent = buildCmd(d.base_url);
   }catch(e){
-    $('inBase').value = location.origin + '/v1';
-    fillExtFields(location.origin);
+    $('inBase').value = APP_BASE + '/v1';
+    fillExtFields(APP_BASE);
     $('cmdText').textContent = '（先在右上角填入 API Key，这里会生成完整命令）';
   }
 }
@@ -1560,7 +1567,7 @@ function renderKey(){
 function toggleKey(){ keyShown = !keyShown; renderKey(); }
 
 function buildCmd(baseUrl){
-  const root = (baseUrl || location.origin).replace(/\/v1\/?$/, '').replace(/\/+$/, '');
+  const root = (baseUrl || APP_BASE).replace(/\/v1\/?$/, '').replace(/\/+$/, '');
   return `python get_muse_cookie.py --base ${root} --key ${realKey || '你的API_KEY'} --label muse-01`;
 }
 
@@ -1585,7 +1592,7 @@ async function copyExKey(){ await copyText($('exKey').value); }
 
 /* 扩展方案：把 BASE URL / API Key 填进页面上的复制框 */
 function fillExtFields(baseUrl){
-  const root = (baseUrl || location.origin)
+  const root = (baseUrl || APP_BASE)
     .replace(/\/v1\/?$/i, '').replace(/\/+$/, '');
   if ($('exBase')) $('exBase').value = root;
   if ($('exKey')) $('exKey').value = realKey || '';
@@ -2316,7 +2323,7 @@ async function upgradeNow(){
     const waitReady = async () => {
       tries++;
       try{
-        const hr = await fetch('/healthz?t=' + Date.now(), {cache: 'no-store'});
+        const hr = await fetch(appUrl('/healthz?t=' + Date.now()), {cache: 'no-store'});
         if (hr.ok) { location.reload(); return; }
       }catch(_){}
       if (tries < 20) setTimeout(waitReady, 1000);

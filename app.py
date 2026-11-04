@@ -244,9 +244,18 @@ def _err_type(status: int) -> str:
     return "invalid_request_error"
 
 
+def _api_request_path(request: Request) -> str:
+    """Keep API error envelopes when deployed behind a stripped URL prefix."""
+    path = request.url.path
+    root = request.scope.get("root_path", "").rstrip("/")
+    if root and (path == root or path.startswith(root + "/")):
+        return path[len(root):] or "/"
+    return path
+
+
 @app.exception_handler(HTTPException)
 async def _http_exc(request: Request, exc: HTTPException):
-    if request.url.path.startswith("/v1/"):
+    if _api_request_path(request).startswith("/v1/"):
         return JSONResponse(
             status_code=exc.status_code,
             content={"error": {"message": str(exc.detail),
@@ -263,7 +272,7 @@ async def _validation_exc(request: Request, exc: RequestValidationError):
     # Never echo user-supplied proxy credentials in validation errors.
     errors = [{k: v for k, v in error.items() if k not in ("input", "ctx")}
               for error in exc.errors()]
-    if request.url.path.startswith("/v1/"):
+    if _api_request_path(request).startswith("/v1/"):
         return JSONResponse(status_code=422, content={"error": {
             "message": "请求参数校验失败：" + str(errors)[:400],
             "type": "invalid_request_error", "param": None, "code": 422}})

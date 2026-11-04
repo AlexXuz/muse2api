@@ -360,6 +360,7 @@ class MuseEngine:
             "--no-first-run", "--no-default-browser-check",
             "--autoplay-policy=no-user-gesture-required",
             "--window-size=1440,2400",
+            "--remote-debugging-address=127.0.0.1",
             f"--remote-debugging-port={self.cfg.cdp_port}",
             "--remote-allow-origins=*",
             f"--user-data-dir={self.cfg.profile_dir}",
