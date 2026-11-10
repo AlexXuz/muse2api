@@ -2094,7 +2094,7 @@ async def test_account(aid: str, _=Depends(auth)):
                                          acc.get("cookies_exp"), account_id=aid)
                     if quota.get("found"):
                         quota["checked_at"] = int(time.time())
-                        store.update_account(aid, quota=quota)
+                        store.update_account(aid, quota=quota, quota_error="")
                     else:
                         quota_error = "额度面板未读到有效数据；旧缓存未覆盖"
                         quota = None
@@ -2183,30 +2183,50 @@ async def query_quota(aid: str, _=Depends(auth)):
         raise HTTPException(400, "该账号没有 cookie")
 
     def _probe():
-        with GEN_LOCK, _account_operation(aid) as acc:
-            acc = _renew_and_persist(aid) or acc
-            engine.start()
-            q = engine.quota(acc["cookies"], acc.get("cookies_exp"), account_id=aid)
-            if not q.get("found"):
-                raise MuseGenerationError("额度面板未读到有效数据；旧缓存未覆盖")
-            q["checked_at"] = int(time.time())
-            store.update_account(aid, quota=q)
-            return q
+        queued_at = time.monotonic()
+        if not GEN_LOCK.acquire(timeout=15):
+            log.warning("quota outcome=busy phase=capacity elapsed=%.1f", time.monotonic() - queued_at)
+            raise HTTPException(409, "浏览器正在执行其他任务，额度查询未开始，请稍后重试")
+        try:
+            with _account_operation(aid) as acc:
+                attempted_at = int(time.time())
+                started = time.monotonic()
+                phase = "session"
+                try:
+                    acc = _renew_and_persist(aid) or acc
+                    phase = "browser"
+                    engine.start()
+                    phase = "usage"
+                    q = engine.quota(acc["cookies"], acc.get("cookies_exp"), account_id=aid)
+                    if not q.get("found"):
+                        raise MuseGenerationError("额度面板未读到有效数据；上次成功结果已保留")
+                    q["checked_at"] = int(time.time())
+                    store.update_account(aid, quota=q, quota_error="", quota_attempted_at=attempted_at)
+                    log.info("quota outcome=success phase=usage elapsed=%.1f", time.monotonic() - started)
+                    return q
+                except HTTPException:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    if isinstance(exc, MuseAuthError):
+                        _mark_session_invalid(aid, exc)
+                        message = "Muse 登录会话已失效，请重新登录该账号后再查额度；管理 API Key 不受影响"
+                    elif isinstance(exc, MuseWorkspaceUnavailableError):
+                        _mark_workspace_unavailable(aid, exc)
+                        message = str(exc)[:300]
+                    elif isinstance(exc, MuseGenerationError):
+                        message = str(exc)[:300]
+                    else:
+                        message = "额度读取暂时失败，请稍后重试；上次成功结果已保留"
+                    # Write while holding the account lease: a later successful
+                    # request must never be overwritten by this attempt's error.
+                    store.update_account(aid, quota_error=message, quota_attempted_at=attempted_at)
+                    log.warning("quota outcome=failed phase=%s error=%s elapsed=%.1f",
+                                phase, type(exc).__name__, time.monotonic() - started)
+                    raise HTTPException(502, message) from exc
+        finally:
+            GEN_LOCK.release()
 
-    try:
-        return await asyncio.to_thread(_probe)
-    except HTTPException:
-        raise
-    except MuseAuthError as exc:
-        _mark_session_invalid(aid, exc)
-        raise HTTPException(401, str(exc)) from exc
-    except MuseWorkspaceUnavailableError as exc:
-        _mark_workspace_unavailable(aid, exc)
-        raise HTTPException(502, str(exc)) from exc
-    except MuseGenerationError as exc:
-        raise HTTPException(502, str(exc)) from exc
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(502, f"额度查询失败: {exc}") from exc
+    return await asyncio.to_thread(_probe)
 
 
 @app.post("/admin/quota")
@@ -2447,7 +2467,7 @@ def _probe_account_sync(aid: str, check_quota: bool = False) -> dict:
                     if not quota.get("found"):
                         raise MuseGenerationError("额度面板未读到有效数据；旧缓存未覆盖")
                     quota["checked_at"] = int(time.time())
-                    store.update_account(aid, quota=quota)
+                    store.update_account(aid, quota=quota, quota_error="")
                 except MuseWorkspaceUnavailableError:
                     raise
                 except Exception as qe:  # noqa: BLE001

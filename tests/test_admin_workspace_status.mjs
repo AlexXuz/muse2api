@@ -21,10 +21,10 @@ for (const [result, available, failed, tone] of [
   assert.equal(button.disabled, false);
 }
 let refreshed = false;
-const ctx = vm.createContext({api:async()=>{throw Error('workspace unavailable')},toast:()=>{},loadPool:()=>{refreshed=true}});
+const ctx = vm.createContext({quotaPending:new Set(),api:async()=>{throw Error('workspace unavailable')},toast:()=>{},loadPool:()=>{refreshed=true}});
 await vm.runInContext(extract('queryQuota')+';queryQuota("fixture")', ctx);
 assert.equal(refreshed, true, 'quota failure must refresh account availability');
-const quota = vm.runInNewContext(extract('quotaBadge', false)+';quotaBadge({workspace_available:false,quota:{found:true,weekly_used_pct:0}})');
+const quota = vm.runInNewContext(extract('quotaBadge', false)+';quotaBadge({workspace_available:false,quota:{found:true,weekly_used_pct:0}})', {quotaPending:new Set()});
 assert.match(quota, /暂不可查询/);
 assert.ok(!quota.includes('已用 0%'), 'cached quota must not look currently usable');
 console.log('PASS: 6 admin workspace/keepalive behavior cases; no network');

@@ -33,8 +33,10 @@ import time
 import uuid
 import unicodedata
 
-from cdp import CDP, http_json
+from cdp import CDP, CDPError, http_json
 from proxy import HTTPProxyRelay, request_proxy_context
+from quota_reader import (DISCOVER_SUBSCRIPTION_ACTION_JS,
+                          build_subscription_fetch_js, parse_subscription_response)
 
 log = logging.getLogger("muse2api")
 
@@ -321,6 +323,8 @@ class MuseEngine:
         self._download_dirs: set[str] = set()
         self.proxy_resolver = None
         self._last_http_renew: dict[str, float] = {}
+        # Public action metadata only; never share an account's quota or session.
+        self._quota_action_cache: tuple[str, float] | None = None
         self._log = None
         os.makedirs(cfg.profile_dir, exist_ok=True)
 
@@ -899,8 +903,12 @@ class MuseEngine:
     })()"""
 
     _QUOTA_DIALOG_JS = r"""(() => {
-        const d = [...document.querySelectorAll('[role=dialog],[aria-modal=true]')]
-            .find(e => e.getClientRects().length > 0 && getComputedStyle(e).visibility !== 'hidden');
+        const dialogs = [...document.querySelectorAll('[role=dialog],[aria-modal=true]')]
+            .filter(e => e.getClientRects().length > 0 && getComputedStyle(e).visibility !== 'hidden');
+        // Other notices can precede Settings in the DOM; never read their numbers as usage.
+        const lines = e => (e.innerText || '').split(/\r?\n/).map(s => s.trim());
+        const d = dialogs.find(e => lines(e).some(s => /^(usage|用量|使用量)$/i.test(s)))
+            || dialogs.find(e => lines(e).some(s => /^(settings|設定|设置)$/i.test(s)));
         return d ? (d.innerText || '') : '';
     })()"""
 
@@ -926,41 +934,123 @@ class MuseEngine:
                                 'windowsVirtualKeyCode': 27, 'nativeVirtualKeyCode': 27})
             time.sleep(0.1)  # Let the UI finish closing before the next interaction.
 
+    def _quota_subscription(self, deadline: float) -> dict | None:
+        """Read the same authenticated action as Settings without waiting for its UI.
+
+        The website can stay connected with its VM-type store unset, hiding Usage.
+        No feature flags are changed: the server authorizes the account's read.
+        An upstream protocol change falls back to the normal Settings reader.
+        """
+        cached = getattr(self, '_quota_action_cache', None)
+        action = cached[0] if cached and cached[1] > time.monotonic() else None
+        for attempt in range(2):
+            try:
+                if deadline - time.monotonic() < 25:
+                    return None
+                if not action:
+                    discovered = json.loads(self.page.js(
+                        DISCOVER_SUBSCRIPTION_ACTION_JS, await_promise=True, timeout=16))
+                    action = discovered.get('action')
+                    if not isinstance(action, str) or not re.fullmatch(r'[a-f0-9]{40,64}', action):
+                        log.info('quota_action discovery_unavailable')
+                        return None
+                    self._quota_action_cache = (action, time.monotonic() + 3600)
+                result = json.loads(self.page.js(build_subscription_fetch_js(action),
+                                                 await_promise=True, timeout=25))
+                status = result.get('status')
+                if (status in (400, 404) or result.get('action_not_found') is True) and attempt == 0:
+                    # Next deploys can invalidate old action IDs. Discover afresh.
+                    self._quota_action_cache = None
+                    action = None
+                    continue
+                if status != 200 or 'text/x-component' not in result.get('content_type', ''):
+                    log.info('quota_action unavailable status=%s',
+                             status if isinstance(status, int) else 'unknown')
+                    return None
+                parsed = parse_subscription_response(result.get('body', ''))
+                parsed['source'] = 'subscription_action'
+                return parsed
+            except (ValueError, TypeError, KeyError, CDPError, TimeoutError) as exc:
+                # RSC may include account metadata; never log raw response/errors.
+                log.info('quota_action fallback error_type=%s', type(exc).__name__)
+                return None
+        return None
+
     def quota(self, cookies: dict, expires: dict | None = None,
               account_id: str | None = None) -> dict:
-        """Read one account's quota in a fresh, disposable browser context."""
-        # Muse's Settings menu can remain in a half-closed React state after a read.
-        # A disposable context is slower, but prevents consecutive reads from
-        # inheriting stale UI and keeps account cookies strictly isolated.
-        self._close_page()
-        try:
-            self.ensure_page(cookies, expires, account_id=account_id)
-            self._quota_click(self._QUOTA_SETTINGS_JS, '找不到设置入口（Settings／設定／设置）')
-            # Some versions open Settings directly; others expose a menu first.
-            open_deadline = time.monotonic() + 8.0
-            while True:
-                self._raise_if_workspace_unavailable()
-                if self.page.js(self._QUOTA_DIALOG_JS):
-                    break
-                menu_item = self.page.js(self._QUOTA_MENU_JS)
-                if menu_item:
-                    pt = json.loads(menu_item)
-                    self._click_point(pt['x'], pt['y'])
-                    break
-                if time.monotonic() >= open_deadline:
-                    raise MuseGenerationError('设置面板或设置菜单未出现，请稍后重试')
-                time.sleep(0.15)
-            deadline = time.monotonic() + 12.0
-            while True:
-                self._raise_if_workspace_unavailable()
-                parsed = self._parse_quota(self.page.js(self._QUOTA_DIALOG_JS) or '')
-                if parsed['found']:
-                    return parsed
-                if time.monotonic() >= deadline:
-                    raise MuseGenerationError('额度面板未读到有效用量；旧缓存未覆盖')
-                time.sleep(0.2)
-        finally:
+        """Read structured usage, with a bounded Settings fallback and one retry.
+
+        Settings can omit Usage when its VM-type state fails to initialize.
+        Prefer its authenticated subscription action. Empty UI is never zero credit.
+        """
+        started = time.monotonic()
+        budget_end = started + 90.0
+        for attempt in range(1, 3):
             self._close_page()
+            stage = 'load_page'
+            try:
+                self.ensure_page(cookies, expires, account_id=account_id)
+                if time.monotonic() >= budget_end:
+                    raise MuseGenerationError('额度页面加载超时')
+                stage = 'open_settings'
+                self._quota_click(self._QUOTA_SETTINGS_JS,
+                                  '找不到设置入口（Settings／設定／设置）',
+                                  timeout=min(8.0, budget_end - time.monotonic()))
+                stage = 'open_dialog'
+                open_deadline = min(budget_end, time.monotonic() + 10.0)
+                while True:
+                    self._raise_if_workspace_unavailable()
+                    if self.page.js(self._QUOTA_DIALOG_JS):
+                        break
+                    menu_item = self.page.js(self._QUOTA_MENU_JS)
+                    if menu_item:
+                        pt = json.loads(menu_item)
+                        self._click_point(pt['x'], pt['y'])
+                        break
+                    if time.monotonic() >= open_deadline:
+                        raise MuseGenerationError('设置面板或设置菜单未出现')
+                    time.sleep(0.2)
+                stage = 'read_usage'
+                parsed = self._quota_subscription(budget_end)
+                if parsed is not None:
+                    parsed['read_attempts'] = attempt
+                    log.info('quota_read success source=subscription_action attempt=%d elapsed=%.1fs',
+                             attempt, time.monotonic() - started)
+                    return parsed
+                stage = 'read_usage'
+                usage_deadline = min(budget_end, time.monotonic() + 30.0)
+                while True:
+                    self._raise_if_workspace_unavailable()
+                    text = self.page.js(self._QUOTA_DIALOG_JS) or ''
+                    if "We couldn't load your usage. Please try again later." in text:
+                        stage = 'usage_error'
+                        raise MuseGenerationError('Muse 官网用量请求暂时失败')
+                    parsed = self._parse_quota(text)
+                    if parsed['found']:
+                        parsed['read_attempts'] = attempt
+                        log.info('quota_read success attempt=%d elapsed=%.1fs',
+                                 attempt, time.monotonic() - started)
+                        return parsed
+                    if time.monotonic() >= usage_deadline:
+                        raise MuseGenerationError('Muse 用量数据未加载完成')
+                    time.sleep(0.4)
+            except (MuseAuthError, MuseWorkspaceUnavailableError, MuseProxyError):
+                # Login, workspace and routing errors require different remedies.
+                raise
+            except (MuseGenerationError, CDPError, TimeoutError) as exc:
+                log.warning('quota_read retryable attempt=%d stage=%s error_type=%s elapsed=%.1fs',
+                            attempt, stage, type(exc).__name__, time.monotonic() - started)
+                if attempt == 2 or time.monotonic() >= budget_end:
+                    messages = {'load_page': 'Muse 页面加载未完成',
+                                'open_settings': 'Muse 设置入口未就绪',
+                                'open_dialog': 'Muse 设置面板未打开',
+                                'usage_error': 'Muse 官网用量请求仍然失败',
+                                'read_usage': 'Muse 用量数据仍未加载完成'}
+                    raise MuseGenerationError(
+                        f'{messages[stage]}（已尝试 {attempt} 次）；旧额度保留，请稍后刷新') from exc
+            finally:
+                self._close_page()
+            time.sleep(min(0.7, max(0.0, budget_end - time.monotonic())))
 
     @staticmethod
     def _parse_quota(txt: str) -> dict:

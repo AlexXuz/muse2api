@@ -1166,6 +1166,11 @@ const I18N_EN = {
   "还没查过。点「操作」里的「额度」实时查询": "Not checked yet. Click \"Quota\" under Actions to query it live",
   "额度数据已超过 1 小时，需重新查询": "Quota data is over 1 hour old; please re-check",
   "查询中…": "Checking…",
+  "正在读取官网额度…": "Reading live Muse usage…",
+  "加载较慢时会自动重试，请稍候": "Slow loading is retried automatically; please wait",
+  "正在从 Muse 官网读取额度，加载较慢时会自动重试，请稍候": "Reading live Muse usage; slow loading is retried automatically. Please wait.",
+  "读取失败，请重试": "Read failed; retry",
+  "刷新失败，显示上次成功结果": "Refresh failed; showing the last successful result",
   "设置面板里没有读到额度数据（可能是页面结构变了）": "No quota data found in the settings panel (the page structure may have changed)",
   "未知": "Unknown",
   "未记录有效期": "No expiry recorded",
@@ -1736,42 +1741,55 @@ async function rotateKey(){
 }
 
 /* ================= 额度显示 ================= */
+const quotaPending = new Set();
 function quotaBadge(a){
+  if (quotaPending.has(a.id)) {
+    return '<span class="badge info">正在读取官网额度…</span><div style="font-size:11px;color:var(--muted)">加载较慢时会自动重试，请稍候</div>';
+  }
   if (a.workspace_available === false) {
     return '<span class="badge warn" title="当前导入会话的 Muse 工作区不可用，无法查询额度；已有缓存仍保留">暂不可查询</span>';
   }
   const q = a.quota;
   if (!q || !q.found){
+    if (a.quota_error) return `<span class="badge warn" title="${esc(a.quota_error)}">读取失败，请重试</span>`;
     return '<span class="badge mute" title="还没查过。点「操作」里的「额度」实时查询">未查</span>';
   }
+  const failed = !!a.quota_error && (!q.checked_at || !a.quota_attempted_at || a.quota_attempted_at >= q.checked_at);
   const pct = (q.weekly_used_pct != null) ? q.weekly_used_pct : null;
-  const cls = pct == null ? 'info' : pct < 50 ? 'ok' : pct < 80 ? 'warn' : 'bad';
+  const cls = failed ? 'mute' : pct == null ? 'info' : pct < 50 ? 'ok' : pct < 80 ? 'warn' : 'bad';
   const plan = (q.plan || '').replace(/\s*plan\s*$/i, '') || '—';
   let title = `计划：${q.plan || '?'}`;
   if (q.weekly_reset) title += `\n周限额重置：${q.weekly_reset}`;
   if (pct != null) title += `\n周用量：已用 ${pct}%`;
   if (q.extra_left) title += `\n额外代币：剩 ${q.extra_left}（已用 ${q.extra_used_pct ?? '?'}%）`;
-  if (q.checked_at) title += `\n查询时间：${fmtTime(q.checked_at)}`;
+  if (q.checked_at) title += `\n上次成功：${fmtTime(q.checked_at)}`;
+  if (failed) title += `\n最近刷新失败：${a.quota_error}`;
   if (q.checked_at && Date.now()/1000 - q.checked_at > 3600) title += '\n额度数据已超过 1 小时，需重新查询';
-  const main = pct != null ? `${plan} · 已用 ${pct}%` : plan;
-  const age = q.checked_at ? `<div class="mono" style="font-size:10px;color:var(--muted);margin-top:2px">查询 ${ago(q.checked_at)}</div>` : '';
+  const main = (failed ? '缓存 · ' : '') + (pct != null ? `${plan} · 已用 ${pct}%` : plan);
+  const age = q.checked_at ? `<div class="mono" style="font-size:10px;color:var(--muted);margin-top:2px" title="${esc(fmtTime(q.checked_at))}">上次成功 ${ago(q.checked_at)}</div>` : '';
   const sub = (q.extra_left ? `<div class="mono" style="font-size:11px;color:var(--muted);margin-top:2px">+${esc(q.extra_left)}</div>` : '') + age;
-  return `<span class="badge ${cls}" title="${esc(title)}">${esc(main)}</span>${sub}`;
+  const warning = failed ? '<div style="font-size:11px;color:var(--warn)">刷新失败，显示上次成功结果</div>' : '';
+  return `<span class="badge ${cls}" title="${esc(title)}">${esc(main)}</span>${sub}${warning}`;
 }
 
 async function queryQuota(aid, btn){
-  if (btn){ btn.disabled = true; btn.textContent = '查询中…'; }
+  if (quotaPending.has(aid)) return;
+  quotaPending.add(aid);
+  if (btn){ btn.disabled = true; btn.textContent = '读取中…'; }
+  toast('正在从 Muse 官网读取额度，加载较慢时会自动重试，请稍候', 'info');
+  loadPool();
   try{
-    const q = await api(`/admin/accounts/${aid}/quota`, {method:'POST'});
+    const q = await api(`/admin/accounts/${encodeURIComponent(aid)}/quota`, {method:'POST'});
     if (q.found){
       const extra = q.extra_left ? `，额外剩 ${q.extra_left}` : '';
       toast(`额度：${q.plan || '?'}，周用量已用 ${q.weekly_used_pct ?? '?'}%${extra}`, 'ok');
     }else{
       toast('设置面板里没有读到额度数据（可能是页面结构变了）', 'warn');
     }
-    loadPool();
   }catch(e){
     toast('额度查询失败：' + e.message, 'bad');
+  }finally{
+    quotaPending.delete(aid);
     if (btn){ btn.disabled = false; btn.textContent = '额度'; }
     loadPool();
   }
@@ -1866,7 +1884,7 @@ async function loadPool(){
         <td><div class="acts">
           <button class="ghost mini" onclick="testAcc('${a.id}')">测试</button>
           <button class="ghost mini" onclick="keepaliveOne('${a.id}')" title="静默刷新会话令牌与有效期">保活</button>
-          <button class="ghost mini" onclick="queryQuota('${a.id}', this)">额度</button>
+          <button class="ghost mini" onclick="queryQuota('${a.id}', this)" ${quotaPending.has(a.id) ? 'disabled' : ''}>${quotaPending.has(a.id) ? '读取中…' : '额度'}</button>
           <button class="ghost mini" onclick="openProxy('${a.id}')">代理</button>
           <button class="ghost mini" onclick="toggleAcc('${a.id}', ${!a.enabled})">${a.enabled ? '禁用' : '启用'}</button>
           <button class="ghost mini" onclick="renameAcc('${a.id}','${esc(a.label)}')">改名</button>
