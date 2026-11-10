@@ -293,7 +293,7 @@ curl -X POST "http://localhost:18610/v1/images/edits" \
   ```
   返回任务 ID：`{"id": "task_xyz789", "status": "queued"}`
 
-  多图参考视频在同一个请求中使用有序的 `images` 数组；这里支持的是多张图片作为视频参考，不支持上传视频文件作为参考：
+  文字和参考图片在同一个 JSON 请求中提交：`prompt` 描述动作与镜头，`images` 是按选择顺序排列的图片数组。每项可直接使用公网 URL、Data URL（`data:image/png;base64,...`）或 `{"url": "..."}` 对象；省略 `images` 即纯文字生视频。其他参考媒体见后文。
   ```bash
   curl -X POST "http://localhost:18610/v1/videos" \
     -H "Authorization: Bearer m2a_your_secret_key" \
@@ -309,6 +309,38 @@ curl -X POST "http://localhost:18610/v1/images/edits" \
     }'
   ```
 
+  | 参数 | 说明 |
+  |---|---|
+  | `prompt` | 必填，文字描述；多图可用 `[图1]`、`[图2]` 指定用途 |
+  | `images` | 可选，有序参考图片数组；所有参考素材字段合计最多 10 个 |
+  | `duration` | 可选，期望时长（秒），未指定时按 6 秒构建生成描述；后台测试页默认 5 秒 |
+  | `size` / `aspect_ratio` | 可选，`16:9` / `9:16` 会写入生成描述；其他值（如 `1:1`）目前不强制约束画幅，实际输出由 Muse 决定 |
+  | `resolution` / `extra` | 可选，画质说明 / 补充要求，作为文字要求交给 Muse |
+  | `timeout` | 可选，服务端任务等待时限（秒），默认取 `MUSE2API_VIDEO_TIMEOUT`（默认 600） |
+
+  兼容旧单图字段 `reference_image`、`image_url`、`image`，择一使用，不要与非空 `images` 混用。视频创建接口接收 JSON，不直接接收 multipart 文件；本机图片应先读取并转成 Data URL，不要传客户端本地路径。
+
+  本机 PNG 图片示例（先设置 `MUSE2API_BASE_URL` 为服务根地址，例如 `https://example.com/muse`，以及 `MUSE2API_KEY`）：
+  ```python
+  import base64
+  import os
+  from pathlib import Path
+  import requests
+
+  base = os.environ["MUSE2API_BASE_URL"].rstrip("/")  # 不含 /v1
+  headers = {"Authorization": "Bearer " + os.environ["MUSE2API_KEY"]}
+  image = "data:image/png;base64," + base64.b64encode(Path("reference.png").read_bytes()).decode("ascii")
+  response = requests.post(base + "/v1/videos", headers=headers, json={
+      "prompt": "让图片里的小球缓慢向右滚动，镜头保持固定",
+      "images": [image], "duration": 5, "size": "16:9"
+  }, timeout=60)
+  response.raise_for_status()
+  task = response.json()
+  print(task["id"])  # 再按下方说明轮询；创建成功不代表已经生成完成
+  ```
+
+  后台上传入口限 PNG/JPEG/WebP、原图总计 10 MiB；API 应用层允许解码后的单素材 40 MiB、合计 100 MiB，但还受反向代理请求体上限约束。若部署的代理上限为 16 MiB，Base64 JSON 的整包也必须低于 16 MiB（图片编码后约增大三分之一）；超限返回 HTTP 413。
+
 - **第二步：轮询任务进度**
   ```bash
   curl "http://localhost:18610/v1/videos/task_xyz789" \
@@ -318,7 +350,7 @@ curl -X POST "http://localhost:18610/v1/images/edits" \
   ```json
   {
     "id": "task_xyz789",
-    "status": "succeeded",
+    "status": "completed",
     "progress": 100,
     "result": {
       "url": "http://localhost:18610/v1/media/vid_xyz789.mp4"
@@ -330,7 +362,7 @@ curl -X POST "http://localhost:18610/v1/images/edits" \
 
 ## 🎞️ 参考素材：图片 / 视频 / 音频 / 文档
 
-生图、图像编辑、图片任务与视频接口都可以附带参考素材，限制与 muse.ai 网页端一致：
+生图、图像编辑、图片任务与视频接口都可以附带参考素材，应用层校验限制如下；实际还受反向代理和 Muse 网页端限制：
 
 | 项目 | 限制 |
 |---|---|
@@ -344,7 +376,7 @@ curl -X POST "http://localhost:18610/v1/images/edits" \
 - JSON 字段：`images`（可混放任意素材）、`videos`、`audios`、`files`，按此顺序依次上传；每项可以是 URL、Data URL、Base64，或 `{"url": ...}` / `{"video_url": ...}` / `{"audio_url": ...}` 对象。
 - 类型取 Data URL / 响应头 / multipart 声明的 MIME；声明为空或 `application/octet-stream` 时按文件头识别。
 - `/v1/images/edits` 的 multipart 可重复提交 `image`、`video`、`audio`、`file` 字段。
-- 视频任务若第一个素材是图片，以它作为主要起始画面；成品绝不会是本次上传的素材本身（按内容哈希排除）。
+- 纯图片参考未指定用途时，生成描述会要求以第一张为主要起始画面；混合媒体按文字描述使用，实际效果由 Muse 决定。下载时按内容哈希排除本次上传的素材，避免把原附件当成生成结果。
 
 ```bash
 curl -X POST "http://localhost:18610/v1/videos"   -H "Authorization: Bearer m2a_your_secret_key"   -H "Content-Type: application/json"   -d '{

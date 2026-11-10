@@ -695,17 +695,31 @@ curl -X POST <span class="s">"BASE/v1/chat/completions"</span> \
 <span class="c"># url 是完整绝对地址，可直接给下游渲染 / 下载；/v1/media/* 无需鉴权。</span>
 <span class="c"># 想要 base64 就传 "response_format":"b64_json"。</span></pre>
 
-      <h4>4. 生视频（curl，异步）</h4>
+      <h4>4. 文字＋图片生视频（JSON，异步）</h4>
+      <div class="hint">POST <code>BASE/v1/videos</code>，兼容 <code>BASE/v1/videos/generations</code>。<code>BASE</code> 是服务根地址（保留部署子路径，不含 <code>/v1</code>）。文字与图片在同一请求中发送，不选图片时省略 <code>images</code>。</div>
+      <div class="tblwrap"><table>
+        <thead><tr><th>参数</th><th>说明</th></tr></thead><tbody>
+          <tr><td class="mono">prompt</td><td>必填，动作、场景或镜头描述；多图可用 [图1]、[图2] 指定用途。</td></tr>
+          <tr><td class="mono">images</td><td>可选，有序图片数组。每项支持公网 URL、Data URL（data:image/png;base64,...）或 {"url":"..."} 对象；所有参考素材合计最多10个。</td></tr>
+          <tr><td class="mono">duration</td><td>期望时长（秒），接口省略时按6秒构建描述，测试页默认5秒。</td></tr>
+          <tr><td class="mono">size / aspect_ratio</td><td>16:9 / 9:16 会写入生成描述；其他值（如1:1）目前不强制约束画幅，实际时长和画幅由 Muse 决定。</td></tr>
+          <tr><td class="mono">resolution / extra</td><td>可选，画质说明 / 补充要求，作为文字要求交给 Muse。</td></tr>
+          <tr><td class="mono">timeout</td><td>服务端任务等待时限（秒），默认取 MUSE2API_VIDEO_TIMEOUT（默认600）。</td></tr>
+        </tbody></table></div>
+      <div class="hint">兼容旧单图字段 <code>reference_image</code>、<code>image_url</code>、<code>image</code>，择一使用，不要与非空 <code>images</code> 混用。此接口接收 JSON；本机图片需转成 Data URL，不要直接提交本地路径或 multipart 文件。</div>
+      <div class="hint">后台上传入口支持 PNG/JPEG/WebP，原图合计不超过10 MiB。API 应用层解码后单素材40 MiB、合计100 MiB，还须满足代理请求体上限；若代理上限为16 MiB，Base64 JSON 整包也必须低于16 MiB，超限返回 HTTP 413。Base64 编码后体积约增加三分之一。</div>
       <pre class="code"><span class="cp" onclick="cp(this)">复制</span><span class="c"># ① 创建任务</span>
 curl -X POST <span class="s">"BASE/v1/videos"</span> \
   -H <span class="s">"Authorization: Bearer $MUSE2API_KEY"</span> \
   -H <span class="s">"Content-Type: application/json"</span> \
-  -d <span class="s">'{"prompt":"一只小猫在草地上走动","duration":5,"size":"16:9"}'</span>
+  -d <span class="s">'{"prompt":"让参考图里的小猫缓慢走动，镜头保持固定","images":["https://example.com/reference.png"],"duration":5,"size":"16:9"}'</span>
 <span class="c"># → {"id":"task_xxx","status":"queued"}</span>
+<span class="c"># 替换示例图片 URL；也可传 data:image/png;base64,...。纯文字生成时删除 images 字段。</span>
 
 <span class="c"># ② 轮询结果</span>
 curl <span class="s">"BASE/v1/videos/task_xxx"</span> -H <span class="s">"Authorization: Bearer $MUSE2API_KEY"</span>
-<span class="c"># → {"status":"succeeded","result":{"url":"/v1/media/xxx.mp4"}}</span></pre>
+<span class="c"># queued / processing：继续等候；completed：读取 result.url；failed：查看 error。</span>
+<span class="c"># → {"status":"completed","result":{"url":"BASE/v1/media/xxx.mp4"}}</span></pre>
 
       <h4>5. Python（openai SDK 兼容）</h4>
       <pre class="code"><span class="cp" onclick="cp(this)">复制</span><span class="k">from</span> openai <span class="k">import</span> OpenAI
@@ -717,16 +731,30 @@ client = OpenAI(base_url=<span class="s">"BASE/v1"</span>, api_key=<span class="
 r = client.images.generate(model=<span class="s">"muse-image"</span>, prompt=<span class="s">"一只戴宇航头盔的柴犬"</span>)
 <span class="k">print</span>(r.data[<span class="s">0</span>].url)
 
-<span class="c"># 生视频（走原生接口，因为是异步任务）</span>
-<span class="k">import</span> requests
-t = requests.post(<span class="s">"BASE/v1/videos"</span>, json={<span class="s">"prompt"</span>:<span class="s">"小猫走动"</span>,<span class="s">"duration"</span>:<span class="s">5</span>},
-                  headers={<span class="s">"Authorization"</span>:<span class="s">"Bearer m2a_..."</span>}).json()
-<span class="k">while</span> <span class="k">True</span>:
-    s = requests.get(<span class="s">f"BASE/v1/videos/{t['id']}"</span>,
-                     headers={<span class="s">"Authorization"</span>:<span class="s">"Bearer m2a_..."</span>}).json()
-    <span class="k">if</span> s[<span class="s">"status"</span>] <span class="k">in</span> (<span class="s">"succeeded"</span>,<span class="s">"failed"</span>): <span class="k">break</span>
-    time.sleep(<span class="s">5</span>)
-<span class="k">print</span>(s)</pre>
+<span class="c"># 本机 PNG ＋文字生视频（走原生 JSON 接口）</span>
+import base64, os, requests
+from pathlib import Path
+headers = {"Authorization": "Bearer " + os.environ["MUSE2API_KEY"]}
+image = "data:image/png;base64," + base64.b64encode(Path("reference.png").read_bytes()).decode("ascii")
+r = requests.post("BASE/v1/videos", headers=headers, json={
+    "prompt": "让图里的小球缓慢向右滚动，镜头保持固定",
+    "images": [image], "duration": 5, "size": "16:9"
+}, timeout=60)
+r.raise_for_status()
+t = r.json()
+deadline = time.monotonic() + 900
+while time.monotonic() &lt; deadline:
+    r = requests.get(f"BASE/v1/videos/{t['id']}", headers=headers, timeout=30)
+    r.raise_for_status()
+    s = r.json()
+    if s["status"] == "completed":
+        print(s["result"]["url"])
+        break
+    if s["status"] == "failed":
+        raise RuntimeError(s.get("error", "视频生成失败"))
+    time.sleep(5)
+else:
+    raise TimeoutError("请在任务记录查看结果，勿重复提交")</pre>
 
       <h4>6. 管理接口</h4>
       <div class="tblwrap"><table>
