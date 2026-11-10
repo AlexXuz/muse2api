@@ -161,6 +161,12 @@
   .result.show{display:block}
   .result img,.result video{max-width:100%;max-height:420px;border-radius:9px;display:block;margin-top:10px;background:#060911}
   pre.out{background:#060911;border:1px solid var(--line);border-radius:9px;padding:12px;overflow:auto;max-height:280px;font-size:12px;color:#9fe8c0;margin:10px 0 0;white-space:pre-wrap;word-break:break-all}
+  .video-ref-tools{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:14px}
+  .video-ref-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:10px;margin-top:12px}
+  .video-ref-card{min-width:0;margin:0;padding:8px;background:var(--bg2);border:1px solid var(--line);border-radius:10px}
+  .video-ref-card img{display:block;width:100%;height:100px;object-fit:contain;background:#060911;border-radius:6px}
+  .video-ref-card figcaption{display:flex;align-items:center;justify-content:space-between;gap:6px;margin-top:7px}
+  .video-ref-name{font-size:11px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:5px}
 
   /* ---------- 提示条 ---------- */
   #toasts{position:fixed;right:20px;bottom:20px;z-index:99;display:flex;flex-direction:column;gap:9px;align-items:flex-end}
@@ -618,6 +624,7 @@
     <div class="card">
       <h3>在线生视频测试 <span class="tag">POST /v1/videos</span></h3>
       <div class="hint">异步任务，一般 60–120 秒完成，页面会自动轮询进度。</div>
+      <div class="hint">可只写提示词，也可添加参考图片。添加图片后，描述你想要的动作与镜头变化；可用 [图1]、[图2] 指定图片用途。</div>
       <div class="row">
         <div style="flex:3"><label>提示词</label>
           <input type="text" id="vidPrompt" value="一只橙色小猫在草地上慢慢走动，阳光明媚"></div>
@@ -626,6 +633,14 @@
         <div style="max-width:140px"><label>比例</label>
           <select id="vidSize"><option>16:9</option><option>9:16</option><option>1:1</option></select></div>
       </div>
+      <div class="video-ref-tools">
+        <input type="file" id="vidRefInput" accept="image/png,image/jpeg,image/webp" multiple hidden onchange="addVideoReferences(this.files);this.value=''">
+        <button type="button" id="vidRefAdd" onclick="$('vidRefInput').click()">添加参考图片</button>
+        <button type="button" id="vidRefClear" onclick="clearVideoReferences()" disabled>清空图片</button>
+        <span id="vidRefSummary" class="muted" aria-live="polite">未添加图片，将使用纯文字生成</span>
+      </div>
+      <div class="hint" style="margin:6px 0 0">支持 PNG、JPEG、WebP，最多10张，总大小不超过10 MiB；图片按选择顺序编号。</div>
+      <div class="video-ref-grid" id="vidRefPreview"></div>
       <div style="margin-top:12px"><button class="primary-lg" id="vidBtn" onclick="runVideo()">开始生成视频</button></div>
       <div class="result" id="vidRes"></div>
     </div>
@@ -1005,6 +1020,26 @@ const I18N_EN = {
   "异步任务，一般 60–120 秒完成，页面会自动轮询进度。": "Asynchronous task, usually done in 60–120 seconds; the page polls progress automatically.",
   "时长(秒)": "Duration (s)",
   "开始生成视频": "Generate video",
+  "可只写提示词，也可添加参考图片。添加图片后，描述你想要的动作与镜头变化；可用 [图1]、[图2] 指定图片用途。": "Use a text prompt alone or add reference images. Describe the motion and camera movement you want; use [图1], [图2] to specify image roles.",
+  "添加参考图片": "Add reference images",
+  "清空图片": "Clear images",
+  "未添加图片，将使用纯文字生成": "No images selected; generate from text only",
+  "支持 PNG、JPEG、WebP，最多10张，总大小不超过10 MiB；图片按选择顺序编号。": "PNG, JPEG or WebP; up to 10 images and 10 MiB total. Images are numbered in selection order.",
+  "参考图片最多10张": "Select up to 10 reference images",
+  "参考图片总大小不能超过10 MiB": "Reference images must total 10 MiB or less",
+  "请选择非空的 PNG、JPEG 或 WebP 图片": "Select non-empty PNG, JPEG or WebP images",
+  "图片预览创建失败，请重新选择": "Could not preview the images; please select them again",
+  "读取参考图片失败，请重新选择图片后再提交": "Could not read a reference image; select the images again before submitting",
+  "参考图片读取超时，请重新选择": "Reading a reference image timed out; select it again",
+  "正在读取参考图片…": "Reading reference images…",
+  "视频任务未完成": "Video task not completed",
+  "网络请求超时，请在任务记录查看结果，勿重复提交": "Network request timed out; check task history before resubmitting",
+  "移除": "Remove",
+  "视频生成失败": "Video generation failed",
+  "未收到任务编号，请在任务记录查看结果，勿重复提交": "No task ID was returned; check task history before resubmitting",
+  "任务已完成但没有视频地址，请在任务记录查看": "Task completed without a video URL; check task history",
+  "等待超过 15 分钟，请在任务记录查看结果，勿重复提交": "Waited over 15 minutes; check task history before resubmitting",
+  "状态查询暂时失败，请在任务记录查看，勿重复提交": "Task polling failed; check task history before resubmitting",
   "接入说明": "Integration guide",
   "1. 可用模型": "1. Available models",
   "模型 ID": "Model ID",
@@ -1273,6 +1308,11 @@ const I18N_EN_HTML = {
 };
 /* 含变量的文案：[正则源码, 替换串]，按顺序匹配整段文本 */
 const I18N_EN_PATTERNS = ([
+  ["已选 (\\d+) 张 · (.*)", "$1 image(s) selected · $2"],
+  ["图(\\d+)", "Image $1"],
+  ["移除图(\\d+)", "Remove image $1"],
+  ["任务 (.*?) · (.*?) · 已等待 (\\d+) 秒", "Task $1 · $2 · waited $3s"],
+  ["任务：(.*)", "Task: $1"],
   ["账号代理请求失败 \\((.*?)\\)；请检查代理连接或认证，未回退直连", "Account proxy request failed ($1); check the proxy connection or credentials. Direct fallback was not used"],
   ["经账号代理唤醒或确认 VM 失败 \\((.*?)\\)；未回退直连", "VM wake or verification through the account proxy failed ($1); direct fallback was not used"],
   ["代理异常: (.*)", "Proxy error: $1"],
@@ -2434,43 +2474,154 @@ async function runImage(){
   }finally{ btn.disabled = false; btn.textContent = '开始生成图片'; }
 }
 
-async function runVideo(){
-  const btn = $('vidBtn'), box = $('vidRes');
-  const prompt = $('vidPrompt').value.trim();
-  if (!prompt) return toast('请输入提示词', 'warn');
-  btn.disabled = true; btn.innerHTML = '<span class="spin"></span>生成中…';
-  box.className = 'result show';
-  box.innerHTML = '<span class="spin"></span>正在创建视频任务…';
-  const t0 = Date.now();
+/* ================= 视频参考图片 ================= */
+const VIDEO_REFERENCE_MAX = 10;
+const VIDEO_REFERENCE_BYTES = 10 * 1024 * 1024;
+let videoReferences = [];
+let videoBusy = false;
+
+function renderVideoReferences(){
+  $('vidRefPreview').innerHTML = videoReferences.map((item, index) => `
+    <figure class="video-ref-card">
+      <img src="${esc(item.preview)}" alt="${esc('图' + (index + 1))}">
+      <figcaption><b>图${index + 1}</b><button type="button" onclick="removeVideoReference(${index})" aria-label="移除图${index + 1}" ${videoBusy ? 'disabled' : ''}>移除</button></figcaption>
+      <div class="video-ref-name" data-no-i18n title="${esc(item.file.name)}">${esc(item.file.name)}</div>
+    </figure>`).join('');
+  $('vidRefSummary').textContent = videoReferences.length
+    ? `已选 ${videoReferences.length} 张 · ${fmtBytes(videoReferences.reduce((n, item) => n + item.file.size, 0))}`
+    : '未添加图片，将使用纯文字生成';
+  $('vidRefInput').disabled = videoBusy;
+  $('vidRefAdd').disabled = videoBusy || videoReferences.length >= VIDEO_REFERENCE_MAX;
+  $('vidRefClear').disabled = videoBusy || !videoReferences.length;
+}
+
+function addVideoReferences(files){
+  if (videoBusy) return;
+  const incoming = Array.from(files || []);
+  if (!incoming.length) return;
+  if (videoReferences.length + incoming.length > VIDEO_REFERENCE_MAX)
+    return toast('参考图片最多10张', 'warn');
+  if (incoming.some(file => !['image/png', 'image/jpeg', 'image/webp'].includes(file.type)
+      || !Number.isFinite(file.size) || file.size <= 0))
+    return toast('请选择非空的 PNG、JPEG 或 WebP 图片', 'warn');
+  const bytes = [...videoReferences.map(item => item.file), ...incoming].reduce((n, file) => n + file.size, 0);
+  if (bytes > VIDEO_REFERENCE_BYTES) return toast('参考图片总大小不能超过10 MiB', 'warn');
+  const added = [];
   try{
-    const t = await api('/v1/videos', {method:'POST', body: JSON.stringify({
-      prompt, duration: parseInt($('vidDur').value) || 5, size: $('vidSize').value})});
-    const tick = async () => {
-      const s = await api('/v1/videos/' + t.id);
-      const el = ((Date.now()-t0)/1000).toFixed(0);
-      if (s.status === 'succeeded' || s.status === 'completed'){
-        const vurl = (s.result && s.result.url) || s.url || '';
-        const vbytes = (s.result && s.result.bytes) || 0;
-        box.innerHTML = `<b style="color:var(--ok)">✓ 生成成功</b>
-          <span class="mono" style="color:var(--muted);margin-left:10px">${el}s · ${fmtBytes(vbytes)}</span>
-          <video src="${esc(vurl)}" controls playsinline></video>
-          <pre class="out">${esc(JSON.stringify(s, null, 2))}</pre>`;
-        btn.disabled = false; btn.textContent = '开始生成视频';
-        loadMedia(); loadTasks();
-      }else if (s.status === 'failed'){
-        box.innerHTML = `<b style="color:var(--bad)">✗ 生成失败</b><pre class="out">${esc(s.error||'')}</pre>`;
-        btn.disabled = false; btn.textContent = '开始生成视频';
-      }else{
-        box.innerHTML = `<span class="spin"></span>任务 ${esc(s.status)} · 已等待 ${el}s（视频通常 60–120 秒）…`;
-        setTimeout(tick, 4000);
-      }
-    };
-    tick();
+    for (const file of incoming) added.push({file, preview:URL.createObjectURL(file)});
   }catch(e){
-    box.innerHTML = `<b style="color:var(--bad)">✗ 创建任务失败</b><pre class="out">${esc(e.message)}</pre>`;
-    btn.disabled = false; btn.textContent = '开始生成视频';
+    for (const item of added) URL.revokeObjectURL(item.preview);
+    return toast('图片预览创建失败，请重新选择', 'bad');
+  }
+  videoReferences.push(...added);
+  renderVideoReferences();
+}
+
+function removeVideoReference(index){
+  if (videoBusy || !Number.isInteger(index) || !videoReferences[index]) return;
+  const [item] = videoReferences.splice(index, 1);
+  URL.revokeObjectURL(item.preview);
+  renderVideoReferences();
+}
+
+function clearVideoReferences(){
+  if (videoBusy) return;
+  for (const item of videoReferences) URL.revokeObjectURL(item.preview);
+  videoReferences = [];
+  $('vidRefInput').value = '';
+  renderVideoReferences();
+}
+
+window.addEventListener('pagehide', event => {
+  // Keep previews alive while a page is retained in the back/forward cache.
+  if (!event.persisted) for (const item of videoReferences) URL.revokeObjectURL(item.preview);
+});
+
+function readVideoReference(file){
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    const failed = () => reject(new Error('读取参考图片失败，请重新选择图片后再提交'));
+    const timer = setTimeout(() => {
+      reject(new Error('参考图片读取超时，请重新选择'));
+      reader.abort();
+    }, 20000);
+    reader.onload = () => {
+      clearTimeout(timer);
+      const data = reader.result;
+      if (typeof data !== 'string' || !/^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/.test(data)) return failed();
+      resolve(data);
+    };
+    reader.onerror = reader.onabort = () => { clearTimeout(timer); failed(); };
+    try{ reader.readAsDataURL(file); }catch(e){ clearTimeout(timer); failed(); }
+  });
+}
+
+async function videoRequest(path, opts, timeout = 60000){
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeout);
+  try{
+    return await api(path, {...(opts || {}), signal:controller.signal});
+  }catch(e){
+    if (controller.signal.aborted) throw new Error('网络请求超时，请在任务记录查看结果，勿重复提交');
+    throw e;
+  }finally{ clearTimeout(timer); }
+}
+
+async function runVideo(){
+  if (videoBusy) return;
+  const btn = $('vidBtn'), box = $('vidRes');
+  const payload = {prompt:$('vidPrompt').value.trim(),
+    duration:parseInt($('vidDur').value) || 5, size:$('vidSize').value};
+  if (!payload.prompt) return toast('请输入提示词', 'warn');
+  const files = videoReferences.map(item => item.file);
+  videoBusy = true;
+  renderVideoReferences();
+  for (const id of ['vidBtn', 'vidPrompt', 'vidDur', 'vidSize']) $(id).disabled = true;
+  btn.innerHTML = '<span class="spin"></span>生成中…';
+  box.className = 'result show';
+  box.textContent = files.length ? '正在读取参考图片…' : '正在创建视频任务…';
+  const t0 = Date.now();
+  let taskId = '';
+  try{
+    if (files.length) payload.images = await Promise.all(files.map(readVideoReference));
+    box.textContent = '正在创建视频任务…';
+    let task = await videoRequest('/v1/videos', {method:'POST', body:JSON.stringify(payload)});
+    taskId = task.id || task.task_id || '';
+    if (!taskId) throw new Error('未收到任务编号，请在任务记录查看结果，勿重复提交');
+    const deadline = Date.now() + 15 * 60 * 1000;
+    let failures = 0;
+    while (!['succeeded', 'completed'].includes(task.status)) {
+      if (Date.now() >= deadline) throw new Error('等待超过 15 分钟，请在任务记录查看结果，勿重复提交');
+      if (task.status === 'failed') throw new Error(task.error || '视频生成失败');
+      box.textContent = `任务 ${taskId} · ${task.status || 'queued'} · 已等待 ${Math.floor((Date.now()-t0)/1000)} 秒`;
+      await new Promise(resolve => setTimeout(resolve, Math.min(4000, deadline - Date.now())));
+      if (Date.now() >= deadline) throw new Error('等待超过 15 分钟，请在任务记录查看结果，勿重复提交');
+      try{
+        task = await videoRequest('/v1/videos/' + encodeURIComponent(taskId), undefined, Math.min(30000, deadline - Date.now()));
+        failures = 0;
+      }catch(e){
+        if (++failures >= 6) throw new Error('状态查询暂时失败，请在任务记录查看，勿重复提交');
+      }
+    }
+    const vurl = (task.result && task.result.url) || task.url || (task.video && task.video.url) || '';
+    if (!vurl) throw new Error('任务已完成但没有视频地址，请在任务记录查看');
+    const vbytes = (task.result && task.result.bytes) || 0;
+    box.innerHTML = `<b style="color:var(--ok)">✓ 生成成功</b>
+      <span class="mono" style="color:var(--muted);margin-left:10px">${((Date.now()-t0)/1000).toFixed(0)}s · ${fmtBytes(vbytes)}</span>
+      <video src="${esc(vurl)}" controls playsinline></video>
+      <pre class="out">${esc(JSON.stringify(task, null, 2))}</pre>`;
+    loadMedia(); loadTasks();
+  }catch(e){
+    box.innerHTML = `<b style="color:var(--bad)">✗ 视频任务未完成</b><pre class="out">${esc(e.message)}${taskId ? '\n任务：' + esc(taskId) : ''}</pre>`;
+    if (taskId) loadTasks();
+  }finally{
+    videoBusy = false;
+    for (const id of ['vidBtn', 'vidPrompt', 'vidDur', 'vidSize']) $(id).disabled = false;
+    btn.textContent = '开始生成视频';
+    renderVideoReferences();
   }
 }
+/* ================= 视频参考图片结束 ================= */
 
 /* ================= 官方仓库实时更新检测、弹窗通知与一键升级 ================= */
 let _notifiedSha = localStorage.getItem('muse2api_notified_sha') || '';
