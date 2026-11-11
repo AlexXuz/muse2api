@@ -33,18 +33,18 @@ with tempfile.TemporaryDirectory(prefix='muse-media-test-', dir=Path.home(), ign
   stale={'src':'old-a','tid':'image','w':5,'h':5}
   new={'src':'new-image','tid':'image','w':5,'h':5}
   calls=[0]
-  def attachment_sequence():
+  def attachment_sequence(**_kwargs):
    calls[0]+=1
    return [stale] if calls[0]==1 else [new]
   engine.attachments=attachment_sequence
   kw={'baseline_sources':{'old-a','old-b'}} if 'baseline_sources' in inspect.signature(engine._wait_attachment).parameters else {}
   selected=engine._wait_attachment('old-b',5,'image',base_att_cnt=2,**kw)
-  engine.attachments=lambda:[{'src':'poster.png','vSrc':'clip.mp4','tid':'video','hasVideo':True,'w':32,'h':32}]
+  engine.attachments=lambda **_kwargs:[{'src':'poster.png','vSrc':'clip.mp4','tid':'video','hasVideo':True,'w':32,'h':32}]
   video=engine._wait_attachment('',3,'video')
-  engine.attachments=lambda:[{'src':'poster_only.png','tid':'image','hasVideo':False,'w':32,'h':32}]
+  engine.attachments=lambda **_kwargs:[{'src':'poster_only.png','tid':'image','hasVideo':False,'w':32,'h':32}]
   fallback_video_rejected=engine._wait_attachment('',1,'video') is None
   # tid 已标 presentation-video，但尚无 <video>/vSrc：封面静帧不得当作命中
-  engine.attachments=lambda:[{'src':'cover.jpg','vSrc':'','tid':'hatch-chat-attachment-presentation-video','hasVideo':False,'w':1280,'h':720}]
+  engine.attachments=lambda **_kwargs:[{'src':'cover.jpg','vSrc':'','tid':'hatch-chat-attachment-presentation-video','hasVideo':False,'w':1280,'h':720}]
   tid_video_cover_rejected=engine._wait_attachment('',1,'video') is None
   page.js('''document.body.innerHTML='<button aria-label="Download" onclick="window.wrongDownload=true">Download</button>';window.wrongDownload=false;''')
   if 'src' in inspect.signature(engine._download_fallback).parameters:

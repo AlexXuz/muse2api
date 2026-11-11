@@ -52,7 +52,7 @@ from config import CFG
 from engine import (ESSENTIAL_COOKIES, MAX_REFERENCE_IMAGE_BYTES,
                     MAX_REFERENCE_IMAGES, MAX_REFERENCE_TOTAL_BYTES,
                     REFERENCE_MIME_EXT, MuseAuthError, MuseEngine, MuseGenerationError,
-                    MuseModelRefusalError, RefImageSafetyError, reference_kind)
+                    MuseModelRefusalError, MuseTextOnlyError, RefImageSafetyError, reference_kind)
 from engine import MuseProxyError, MuseWorkspaceUnavailableError
 from store import Store, account_expiry, min_expiry
 from proxy import normalize_server, request_proxy_context
@@ -985,6 +985,13 @@ def parse_tool_calls(text: str) -> tuple[list[dict] | None, str]:
     return None, text
 
 
+VIDEO_OUTPUT_CONTRACT = (
+    "直接调用可用视频生成能力并交付可播放视频附件；"
+    "不要以静帧或分镜文字替代；无法生成时请明确说明原因。"
+)
+VIDEO_RETRY_MIN_SECONDS = 120
+
+
 def build_video_prompt(r: VideoRequest, kinds: list[str] | None = None) -> str:
     user_prompt = r.prompt.strip()
     ar = (r.aspect_ratio or "").strip().lower()
@@ -1036,6 +1043,7 @@ def build_video_prompt(r: VideoRequest, kinds: list[str] | None = None) -> str:
         parts.append(f"画质规格：{r.resolution}")
     if r.extra:
         parts.append(r.extra)
+    parts.append(VIDEO_OUTPUT_CONTRACT)
     return "，".join(parts)
 
 
@@ -1142,7 +1150,7 @@ def _run_generation(prompt: str, kind: str, timeout: int,
                     account_id: str | None = None, on_progress=None,
                     reference_image: str | None = None,
                     reference_images: list[str] | None = None,
-                    on_acquired=None) -> tuple[dict, str | None]:
+                    on_acquired=None, on_attempt=None) -> tuple[dict, str | None]:
     # Browser ownership covers account selection, retry and cleanup, not just generate().
     deadline = time.monotonic() + max(1, timeout)
     if not GEN_LOCK.acquire(timeout=max(1, timeout)):
@@ -1155,16 +1163,89 @@ def _run_generation(prompt: str, kind: str, timeout: int,
                 pass
         return _run_generation_locked(prompt, kind, timeout, account_id,
                                       on_progress, reference_image, reference_images,
-                                      deadline=deadline)
+                                      deadline=deadline, on_attempt=on_attempt)
     finally:
         GEN_LOCK.release()
+
+
+def _video_error_code(exc: Exception) -> str:
+    if isinstance(exc, MuseTextOnlyError):
+        return "video_text_only"
+    if isinstance(exc, MuseModelRefusalError):
+        return "model_refusal"
+    if isinstance(exc, MuseAuthError):
+        return "auth_error"
+    if isinstance(exc, MuseWorkspaceUnavailableError):
+        return "workspace_unavailable"
+    if isinstance(exc, MuseProxyError):
+        return "proxy_error"
+    if isinstance(exc, MuseGenerationError) and str(exc).startswith("账号额度不足"):
+        return "quota_exceeded"
+    if isinstance(exc, MuseGenerationError) and str(exc).startswith("等待浏览器队列超时"):
+        return "browser_queue_timeout"
+    return "generation_unknown"
+
+
+def _run_video_generation(prompt: str, timeout: int, account: dict,
+                          on_progress=None, reference_image=None,
+                          reference_images=None, deadline=None, on_attempt=None):
+    """Only a positively classified text-only completion permits one more video request.
+
+    The caller owns the same browser/account leases for the entire operation.
+    Neither a generic failure nor a timeout is evidence that generation stopped.
+    """
+    if deadline is None:
+        deadline = time.monotonic() + max(1, timeout)
+    try:
+        retry_limit = min(1, max(0, int(getattr(CFG, "video_text_retry_limit", 0))))
+    except (TypeError, ValueError):
+        retry_limit = 0
+    _bind_account_proxy(account)
+    refreshed = _renew_and_persist(account["id"], wake_vm=True)
+    if refreshed:
+        account = refreshed
+    engine.start()
+    refs = list(reference_images or [])
+    engine_kwargs = {}
+    if len(refs) == 1 and not reference_image:
+        reference_image = refs[0]
+    elif len(refs) > 1:
+        engine_kwargs["reference_images"] = refs
+
+    for attempt in range(1 + retry_limit):
+        remaining = int(deadline - time.monotonic())
+        if attempt and remaining < VIDEO_RETRY_MIN_SECONDS:
+            if on_attempt:
+                on_attempt({"attempts": attempt, "retry_count": attempt - 1,
+                            "retry_reason": "insufficient_deadline", "stage": "failed",
+                            "error_code": "video_text_only"})
+            raise MuseTextOnlyError("上次仅返回文字，剩余总时限不足 120 秒，未执行自动重试")
+        if remaining <= 0:
+            raise MuseGenerationError("任务总等待时间已到，停止重试")
+        if on_attempt:
+            on_attempt({"attempts": attempt + 1, "retry_count": attempt,
+                        "retry_reason": "video_text_only" if attempt else None,
+                        "stage": "retrying" if attempt else "waiting_media", "error_code": None})
+        attempt_prompt = prompt if not attempt else prompt + "\n\n" + VIDEO_OUTPUT_CONTRACT
+        try:
+            result = engine.generate(account["cookies"], attempt_prompt, expect="video",
+                                     timeout=remaining, expires=account.get("cookies_exp"),
+                                     account_id=account["id"], on_progress=on_progress,
+                                     reference_image=reference_image, **engine_kwargs)
+        except MuseTextOnlyError:
+            if attempt >= retry_limit:
+                raise
+            continue
+        store.mark(account["id"], True, "")
+        _sync_cookies(account["id"])
+        return result, account["id"]
 
 
 def _run_generation_locked(prompt: str, kind: str, timeout: int,
                     account_id: str | None = None, on_progress=None,
                     reference_image: str | None = None,
                     reference_images: list[str] | None = None,
-                    deadline=None) -> tuple[dict, str | None]:
+                    deadline=None, on_attempt=None) -> tuple[dict, str | None]:
     remaining_wait = int(deadline - time.monotonic()) if deadline is not None else timeout
     preferred_id = getattr(engine, "current_acc_id", None)
     if kind == "video" and not account_id:
@@ -1183,6 +1264,20 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
     cur_acc = acc
     last_exc = None
     try:
+        if kind == "video":
+            try:
+                return _run_video_generation(prompt, timeout, cur_acc, on_progress,
+                                             reference_image, reference_images, deadline, on_attempt)
+            except MuseAuthError as exc:
+                _mark_session_invalid(cur_acc["id"], exc)
+                raise
+            except MuseWorkspaceUnavailableError as exc:
+                _mark_workspace_unavailable(cur_acc["id"], exc)
+                raise
+            except MuseProxyError as exc:
+                store.touch_keepalive(cur_acc["id"], None, f"代理异常: {str(exc)[:160]}")
+                raise
+        # Existing image retry/account rotation remains unchanged.
         for attempt in range(2):
             if deadline is not None and time.monotonic() >= deadline:
                 raise MuseGenerationError("任务总等待时限已到，停止重试")
@@ -1518,7 +1613,8 @@ async def create_video(req: VideoRequest, _=Depends(auth)):
     prompt = build_video_prompt(req, _reference_kinds(ref_images))
     timeout = req.timeout or CFG.video_timeout
     task = store.create_task("video", req.prompt)
-    store.update_task(task["id"], api_prompt=prompt)
+    store.update_task(task["id"], api_prompt=prompt, attempts=0, retry_count=0,
+                      retry_reason=None, stage="queued", error_code=None)
 
     store.update_task(task["id"], progress=10)
 
@@ -1526,14 +1622,16 @@ async def create_video(req: VideoRequest, _=Depends(auth)):
         timing = {"t0": time.time()}
         def _on_acquired():
             timing["t0"] = time.time()
-            store.update_task(task["id"], status="processing", progress=15)
+            store.update_task(task["id"], status="processing", progress=15, stage="waiting_media")
         try:
             def prog_cb(p):
                 store.update_task(task["id"], progress=p)
             res, acc_id = _run_generation(prompt, "video", timeout, on_progress=prog_cb,
-                                          reference_images=ref_images, on_acquired=_on_acquired)
+                                          reference_images=ref_images, on_acquired=_on_acquired,
+                                          on_attempt=lambda metadata: store.update_task(task["id"], **metadata))
             vurl = media_url(res["filename"])
             store.update_task(task["id"], status="completed", progress=100, account=acc_id,
+                              stage="completed", error_code=None,
                               elapsed=round(time.time() - timing["t0"], 1),
                               url=vurl,
                               video={"url": vurl},
@@ -1541,7 +1639,7 @@ async def create_video(req: VideoRequest, _=Depends(auth)):
                                       "filename": res["filename"],
                                       "bytes": res["size"], "kind": res["kind"]})
         except Exception as exc:  # noqa: BLE001
-            store.update_task(task["id"], status="failed",
+            store.update_task(task["id"], status="failed", stage="failed", error_code=_video_error_code(exc),
                               elapsed=round(time.time() - timing["t0"], 1), error=str(exc))
 
     threading.Thread(target=worker, daemon=True).start()
@@ -1950,11 +2048,13 @@ def admin_status(_=Depends(auth)):
         "media_count": len(os.listdir(CFG.media_dir))
         if os.path.isdir(CFG.media_dir) else 0,
         "browser_running": bool(engine.proc and engine.proc.poll() is None),
+        "generation_busy": GEN_LOCK.locked(),
         "essential_cookies": list(ESSENTIAL_COOKIES),
         "base_url": f"{base}/v1" if base else "",
         "config": {"site": CFG.site_url, "cdp_port": CFG.cdp_port,
                    "image_timeout": CFG.image_timeout,
                    "video_timeout": CFG.video_timeout,
+                   "video_text_retry_limit": CFG.video_text_retry_limit,
                    "host": CFG.host, "port": CFG.port,
                    "public_base": base},
     }

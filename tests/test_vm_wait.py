@@ -8,7 +8,7 @@ m.time=SimpleNamespace(time=lambda:clock[0],sleep=lambda s:clock.__setitem__(0,c
 engine=object.__new__(m.MuseEngine)
 engine._scroll_bottom=lambda:None
 engine.page=SimpleNamespace(js=lambda _:json.dumps({'tail':'Connecting...','cnt':0,'txt':'','stop':True}))
-engine.attachments=lambda:[] if clock[0]<20 else [{'src':'generated','tid':'image','w':100,'h':100}]
+engine.attachments=lambda **_kwargs:[] if clock[0]<20 else [{'src':'generated','tid':'image','w':100,'h':100}]
 try:
  result=engine._wait_attachment('',30,'image')
  print('RESULT',result['src'],'elapsed',round(clock[0],1))

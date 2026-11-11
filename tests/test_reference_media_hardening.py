@@ -51,8 +51,8 @@ with tempfile.TemporaryDirectory() as home:
     originals = [("reference-" + str(i)).encode() for i in range(10)]
     queue = [{"src": "upload-" + str(i), "vSrc": "upload-" + str(i)} for i in range(10)]
     queue.append({"src": "result", "vSrc": "result"})
-    engine.attachments = lambda: []
-    engine._agent_count = lambda: 0
+    engine.attachments = lambda **_kwargs: []
+    engine._agent_count = lambda **_kwargs: 0
     engine._send = lambda prompt: "clicked"
     engine._wait_attachment = lambda *a, **k: queue.pop(0)
     engine.extract_bytes = lambda src, expect: (

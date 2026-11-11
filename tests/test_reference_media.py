@@ -168,8 +168,8 @@ with tempfile.TemporaryDirectory() as home:
     hits = iter([{"src": "poster", "vSrc": "blob:upload", "hasVideo": True, "w": 9, "h": 9},
                  {"src": "poster2", "vSrc": "blob:result", "hasVideo": True, "w": 9, "h": 9}])
     seen_baselines = []
-    guard.attachments = lambda: []
-    guard._agent_count = lambda: 0
+    guard.attachments = lambda **_kwargs: []
+    guard._agent_count = lambda **_kwargs: 0
     guard._send = lambda prompt: "clicked"
 
     def fake_wait(*args, baseline_sources=None, **kwargs):

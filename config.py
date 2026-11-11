@@ -101,6 +101,10 @@ class Config:
     # 生成
     image_timeout: int = field(default_factory=lambda: int(_env("MUSE2API_IMAGE_TIMEOUT", "240")))
     video_timeout: int = field(default_factory=lambda: int(_env("MUSE2API_VIDEO_TIMEOUT", "600")))
+    # Only confirmed text-only video failures may consume one additional generation.
+    # Off by default because the upstream may charge for the extra attempt.
+    video_text_retry_limit: int = field(
+        default_factory=lambda: min(1, max(0, int(_env("MUSE2API_VIDEO_TEXT_RETRY_LIMIT", "0")))))
     chat_timeout: int = field(default_factory=lambda: int(_env("MUSE2API_CHAT_TIMEOUT", "300")))
     max_concurrency: int = field(default_factory=lambda: max(1, int(_env("MUSE2API_CONCURRENCY", "2"))))
 

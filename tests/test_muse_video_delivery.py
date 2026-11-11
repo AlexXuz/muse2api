@@ -36,7 +36,7 @@ with tempfile.TemporaryDirectory() as profile:
     engine_module.time = SimpleNamespace(time=lambda: clock[0], sleep=lambda n: clock.__setitem__(0, clock[0] + n))
     engine.page = SimpleNamespace(js=lambda _: json.dumps({
         "cnt": 0, "txt": "", "stop": True, "tail": "Still sending"}))
-    engine.attachments = lambda: []
+    engine.attachments = lambda **_kwargs: []
     try:
         engine._wait_attachment("", 60, "video")
     except engine_module.MuseGenerationError as exc:
@@ -73,7 +73,7 @@ def wait_case(states, timeout=600, expect="video"):
     page = SimpleNamespace(js=js)
     e = engine_module.MuseEngine(SimpleNamespace(profile_dir=tempfile.gettempdir()))
     e.page = page
-    e.attachments = lambda: []
+    e.attachments = lambda **_kwargs: []
     e._scroll_bottom = lambda: None
     with patch.object(engine_module, "time", clock):
         return e._wait_attachment("", timeout, expect)

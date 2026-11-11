@@ -241,6 +241,10 @@ class MuseModelRefusalError(MuseGenerationError):
     """Muse completed the turn with text instead of the requested media."""
 
 
+class MuseTextOnlyError(MuseModelRefusalError):
+    """A new video turn explicitly ended without media after a delivery grace period."""
+
+
 class RefImageSafetyError(MuseGenerationError):
     """A reference image source is forbidden by the configured input policy."""
 
@@ -1148,11 +1152,16 @@ class MuseEngine:
         "})()"
     )
 
-    def attachments(self) -> list[dict]:
+    def attachments(self, *, strict: bool = False) -> list[dict]:
         try:
             raw = self.page.js(self._ATT_JS)
-            return json.loads(raw) if raw else []
+            result = json.loads(raw)
+            if not isinstance(result, list) or any(not isinstance(item, dict) for item in result):
+                raise ValueError("附件状态无效")
+            return result
         except Exception:  # noqa: BLE001
+            if strict:
+                raise
             return []
 
     # ---------------- 发送 ----------------
@@ -1287,7 +1296,9 @@ class MuseEngine:
         stable_src, stable_n = "", 0
         last_txt, txt_stable = "", 0
         refusal_last, refusal_stable = "", 0
+        text_only_candidate, text_only_since = "", None
         seen_stop = False
+        seen_new_attachment = False
         previous_state = None
         last_activity = t_start
         progress_sent = 0
@@ -1295,8 +1306,21 @@ class MuseEngine:
             if stop_event is not None and stop_event.is_set():
                 raise MuseGenerationError("客户端已断开连接，终止生成任务")
             time.sleep(0.6)
+            if time.time() >= deadline:
+                break
             self._scroll_bottom()
-            atts = self.attachments()
+            try:
+                atts = self.attachments(strict=True)
+            except Exception:
+                # A failed CDP read is not evidence of an empty page or a finished turn.
+                refusal_last, refusal_stable = "", 0
+                last_txt, txt_stable = "", 0
+                text_only_candidate, text_only_since = "", None
+                last_activity = time.time()
+                continue
+            seen_new_attachment = seen_new_attachment or len(atts) > base_att_cnt or any(
+                a.get(key) and a[key] not in baseline_sources
+                for a in atts for key in ("src", "vSrc", "iSrc"))
             # 严格按期望类型挑选附件，绝不接受跨模态兜底（如将视频请求降级为图片封面）
             matching_atts = []
             for a in atts:
@@ -1355,18 +1379,29 @@ class MuseEngine:
                         || document.querySelector('button[aria-label*="Stop" i]')
                         || document.querySelector('button[aria-label*="停止"]'));
                     var tail = document.body ? (document.body.innerText||'').slice(-1200) : '';
-                    return JSON.stringify({cnt: bs.length, txt: lastTxt, stop: hasStop, tail: tail,
+                    var cards = [...document.querySelectorAll('[data-testid^="hatch-chat-attachment-presentation-"]')]
+                        .filter(el => !el.closest('form, [class*=chat-user-bubble], [class*="group/msg"]')).length;
+                    return JSON.stringify({cnt: bs.length, txt: lastTxt, stop: hasStop, tail: tail, cards: cards,
                         path: location.pathname || '', href: location.href || ''});
                 })()""")
-                st = json.loads(st_raw) if st_raw else {}
+                st = json.loads(st_raw)
+                if (not isinstance(st, dict) or not isinstance(st.get("cnt"), int)
+                        or not isinstance(st.get("txt"), str) or not isinstance(st.get("stop"), bool)):
+                    raise ValueError("生成状态无效")
             except Exception:
-                st = {}
+                refusal_last, refusal_stable = "", 0
+                last_txt, txt_stable = "", 0
+                text_only_candidate, text_only_since = "", None
+                last_activity = time.time()
+                continue
             tail = st.get("tail") or ""
             cur_cnt = int(st.get("cnt") or 0)
             cur_txt = st.get("txt") or ""
             has_stop = bool(st.get("stop"))
             path = st.get("path") or ""
             seen_stop = seen_stop or has_stop
+            # Even a source-less video card or a cover is evidence of in-flight media.
+            seen_new_attachment = seen_new_attachment or (st.get("cards") or 0) > base_att_cnt
             state = (cur_cnt, cur_txt, len(atts), has_stop, path)
             if previous_state is None or state != previous_state:
                 last_activity = time.time()
@@ -1383,7 +1418,7 @@ class MuseEngine:
                     except Exception:
                         pass
 
-            if re.search(r"额度不足|积分不足|out of credits|达到上限|token limit", tail, re.I):
+            if re.search(r"额度不足|积分不足|余额不足|out of credits|insufficient credits|达到上限|token limit|quota exceeded", tail, re.I):
                 raise MuseGenerationError("账号额度不足")
             # A Stop button is also shown for messages never acknowledged by the gateway.
             if elapsed > 30.0 and cur_cnt == base_agent_cnt and re.search(
@@ -1404,7 +1439,22 @@ class MuseEngine:
             else:
                 refusal_last, refusal_stable = "", 0
 
-            if cur_cnt > base_agent_cnt and cur_txt and not has_stop and len(atts) <= base_att_cnt:
+            if expect == "video":
+                # Only an observed Stop lifecycle and an explicit new-message failure
+                # can authorize a caller's bounded retry. Never infer failure from silence.
+                candidate = self._video_text_only_failure(cur_txt) if (
+                    cur_cnt > base_agent_cnt and seen_stop and not has_stop and not seen_new_attachment
+                ) else ""
+                if candidate:
+                    candidate_key = (cur_cnt, path, candidate)
+                    if candidate_key != text_only_candidate:
+                        text_only_candidate, text_only_since = candidate_key, time.time()
+                    elif text_only_since is not None and time.time() - text_only_since >= 30.0:
+                        raise MuseTextOnlyError(
+                            f"模型明确未生成视频，等待附件30秒后仍无视频: {self._clean_model_text(candidate)}")
+                else:
+                    text_only_candidate, text_only_since = "", None
+            elif cur_cnt > base_agent_cnt and cur_txt and not has_stop and len(atts) <= base_att_cnt:
                 # Media-status text can precede a real attachment; do not fail on it.
                 is_media_report = self._media_status_pending(cur_txt)
                 if not is_media_report:
@@ -1470,6 +1520,29 @@ class MuseEngine:
         """Return only an explicit media refusal line, never an arbitrary page tail."""
         if not text:
             return ""
+        if expect == "video":
+            if re.search(r"违规|违法|违禁|禁止生成|禁止提供|\b(?:disallowed|prohibited|illegal|forbidden)\b", text, re.I):
+                return cls._clean_model_text(text)
+            blocked_reason = re.search(
+                r"地区|国家|地域|内容|安全|政策|审核|版权|权限|授权|订阅|额度|积分|余额|"
+                r"\b(?:country|region|territory|content|safety|policy|policies|moderation|copyright|"
+                r"permission|access|authorization|subscription|quota|credits?|balance)\b", text, re.I)
+            blocked_outcome = re.search(
+                r"不支持|不可用|无法|不能|拒绝|不允许|违反|违规|不足|超限|未授权|受限|"
+                r"未通过|不符合|无权限|没有权限|禁用|封禁|"
+                r"\b(?:unavailable|unsupported|blocked|denied|unauthorized|forbidden|refus\w*|"
+                r"violat\w*|insufficient|exceeded|exhausted|cannot|can['’]t|unable)\b|"
+                r"not (?:available|supported|allowed|permitted)|out of credits", text, re.I)
+            if blocked_reason and blocked_outcome:
+                return cls._clean_model_text(text)
+            if re.search(r"地区|国家|安全|政策|审核|版权|权限|授权|订阅|额度|积分|余额|"
+                         r"\b(?:region|country|safety|policy|moderation|permission|subscription|quota|credits?)\b", text, re.I) and re.search(
+                    r"失败|没能生成|未能生成|未成功|\bfailed\b", text, re.I):
+                return cls._clean_model_text(text)
+            # Capability refusals are not proof of a transient failed rendering job.
+            if re.search(r"(?:我|当前模型|本模型)(?:无法|不能|不支持)[^。！？\n]{0,24}(?:生成|制作)视频|"
+                         r"\b(?:I cannot|I can['’]t|I am unable to)\s+(?:generate|create|make)\s+(?:a\s+)?video", text, re.I):
+                return cls._clean_model_text(text)
         patterns = [
             r"^(?:没生成成|视频没生成成功|视频未生成成功|视频生成失败)[^\n]{0,240}"
             r"(?:国家|地区|country|region)[^\n]{0,160}(?:不支持|不可用|无法|not available|unavailable|not supported)",
@@ -1484,6 +1557,40 @@ class MuseEngine:
             if clean and any(re.search(pattern, clean, re.I) for pattern in patterns):
                 return clean
         return ""
+
+    @classmethod
+    def _video_text_only_failure(cls, text: str) -> str:
+        """Conservative retry eligibility: a failed render, never refusal or delivery trouble."""
+        if not text or cls._media_refusal_text(text, "video"):
+            return ""
+        # A mixed failure/progress report can describe an earlier attempt while work
+        # continues. Likewise, generated-but-not-delivered is not an empty result.
+        if re.search(
+                r"[\"“”‘’「」『』`]|(?:^|[\s:：])'[^']+'(?:$|[\s.,!?])|"
+                r"上次|上一次|上一轮|之前|此前|先前|历史|引用|引述|原话|示例|曾经|过去|"
+                r"已完成|已经完成|成功完成|完成了|成品|"
+                r"\b(?:previous|earlier|prior|histor\w*|quot\w*|example|completed|finished|succeeded|ready)\b|"
+                r"\blast\s+(?:attempt|time|video|render)\b|"
+                r"正在|仍在|生成中|渲染中|处理中|稍等|等待|尚未|暂未|还未|还没有|尚无|"
+                r"(?:我|系统|工具)(?:会|将|正在)|如果|假如|可能|也许|上传|下载|转存|交付|"
+                r"(?:视频|短片|影片)[^。！？\n]{0,16}(?:已生成|已经生成|生成成功|生成完成)|"
+                r"(?:已生成|已经生成|成功生成)[^。！？\n]{0,16}(?:视频|短片|影片)|"
+                r"\b(?:generating|rendering|processing|pending|waiting|working|retrying|"
+                r"upload\w*|download\w*|deliver\w*|still|yet|maybe|perhaps|might|will)\b|"
+                r"(?<!no )\b(?:video|clip)\s+(?:was|has been|is)\s+(?:successfully\s+)?(?:generated|created|ready)\b",
+                text, re.I):
+            return ""
+        failed = re.search(
+            r"(?:这(?:一)?镜|本次|这次|视频|短片|影片|动画)[^。！？\n]{0,40}"
+            r"(?:没能|未能|没(?:有)?|未)(?:成功)?(?:生成|产出|出片)|"
+            r"(?:视频|短片|影片|动画)(?:生成|制作|渲染)(?:失败|未成功)|"
+            r"(?:没(?:有)?|未)(?:生成|产出)(?:出)?(?:可播放的)?(?:视频|短片|影片)|"
+            r"(?:没有|未)出片|"
+            r"\b(?:video|clip)(?:\s+(?:generation|render))?\s+(?:generation\s+)?failed\b|"
+            r"\b(?:video|clip)\s+(?:has not been|hasn['’]t been|was not|wasn['’]t|could not be|couldn['’]t be)"
+            r"\s+(?:successfully\s+)?(?:generated|created|rendered)\b|"
+            r"\bno\s+(?:video|clip)\s+(?:was|has been)\s+(?:generated|created|rendered)\b", text, re.I)
+        return text.strip() if failed else ""
 
     # ---------------- 取字节 ----------------
     _EXTRACT_JS = r"""
@@ -1558,10 +1665,18 @@ class MuseEngine:
         except Exception:  # noqa: BLE001
             return ""
 
-    def _agent_count(self) -> int:
+    def _agent_count(self, *, strict: bool = False) -> int:
         try:
-            return int(self.page.js(self._AGENT_COUNT_JS) or 0)
+            raw = self.page.js(self._AGENT_COUNT_JS)
+            if strict and (raw is None or isinstance(raw, bool)):
+                raise ValueError("消息数量状态无效")
+            count = int(raw or 0)
+            if strict and (count < 0 or str(count) != str(raw)):
+                raise ValueError("消息数量状态无效")
+            return count
         except Exception:  # noqa: BLE001
+            if strict:
+                raise
             return 0
 
     def _user_count(self) -> int:
@@ -1952,11 +2067,14 @@ class MuseEngine:
 
     def _generate_attached(self, prompt: str, expect: str, deadline: float,
                            on_progress, stop_event, upload_hashes: set) -> dict:
-        atts_before = self.attachments()
+        try:
+            atts_before = self.attachments(strict=True) if expect == "video" else self.attachments()
+            base_agent_cnt = self._agent_count(strict=True) if expect == "video" else self._agent_count()
+        except Exception as exc:
+            raise MuseGenerationError("发送前无法确认视频会话状态，已停止发送") from exc
         baseline_sources = {a.get(k) for a in atts_before for k in ("src", "vSrc", "iSrc") if a.get(k)}
         base = atts_before[-1] if atts_before else {}
         baseline_src = base.get("src") or ""
-        base_agent_cnt = self._agent_count()
         if time.monotonic() >= deadline:
             raise MuseGenerationError("任务准备超时，已停止发送")
         if self._send(prompt) not in ("clicked", "enter-sent"):
