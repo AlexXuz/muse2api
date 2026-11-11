@@ -57,6 +57,8 @@ from engine import MuseProxyError, MuseWorkspaceUnavailableError
 from store import Store, account_expiry, min_expiry
 from proxy import normalize_server, request_proxy_context
 from native_login import NativeLoginError, NativeLoginService
+from video_recovery import (MAX_DIAGNOSTIC_CHARS, VIDEO_OUTPUT_CONTRACT, build_diagnostic_prompt,
+                            build_retry_prompt, normalize_video_style, parse_diagnostic)
 
 import sys
 log = logging.getLogger("muse2api")
@@ -985,15 +987,12 @@ def parse_tool_calls(text: str) -> tuple[list[dict] | None, str]:
     return None, text
 
 
-VIDEO_OUTPUT_CONTRACT = (
-    "直接调用可用视频生成能力并交付可播放视频附件；"
-    "不要以静帧或分镜文字替代；无法生成时请明确说明原因。"
-)
 VIDEO_RETRY_MIN_SECONDS = 120
+VIDEO_DIAGNOSTIC_MAX_SECONDS = 45
 
 
 def build_video_prompt(r: VideoRequest, kinds: list[str] | None = None) -> str:
-    user_prompt = r.prompt.strip()
+    user_prompt = normalize_video_style(r.prompt.strip())
     ar = (r.aspect_ratio or "").strip().lower()
     sz = (r.size or "").strip().lower()
     dur = r.duration or 6
@@ -1025,26 +1024,28 @@ def build_video_prompt(r: VideoRequest, kinds: list[str] | None = None) -> str:
     parts = []
     if is_vertical:
         if has_ref:
-            parts.append(f"{reference_instruction}：生成一个严格9:16竖屏手机满屏的动态{gen_word}（9:16 vertical portrait video，720x1280，高大于宽的手机全屏竖版画面，严禁生成横屏或黑边，时长严格为 {dur} 秒）：{user_prompt}")
+            parts.append(f"{reference_instruction}：生成一个严格9:16竖屏手机满屏的动态{gen_word}（9:16 vertical portrait video，720x1280，高大于宽的手机全屏竖版画面，严禁生成横屏或黑边，时长严格为 {dur} 秒）")
         else:
-            parts.append(f"全新文生视频创作（纯文本全新生成，严禁参考任何历史图片或上下文）：生成一个严格9:16竖屏手机满屏视频（9:16 vertical portrait video，720x1280，高大于宽的手机全屏竖版画面，严禁生成横屏或带有左右黑边，保持垂直构图，时长严格为 {dur} 秒）：{user_prompt}")
+            parts.append(f"全新文生视频创作（纯文本全新生成，严禁参考任何历史图片或上下文）：生成一个严格9:16竖屏手机满屏视频（9:16 vertical portrait video，720x1280，高大于宽的手机全屏竖版画面，严禁生成横屏或带有左右黑边，保持垂直构图，时长严格为 {dur} 秒）")
     elif any(k in ar or k in sz for k in ("16:9", "16/9", "landscape", "横屏", "1280x720", "1920x1080")):
         if has_ref:
-            parts.append(f"{reference_instruction}：生成一个16:9宽屏横屏{gen_word}（16:9 widescreen landscape video，时长严格为 {dur} 秒）：{user_prompt}")
+            parts.append(f"{reference_instruction}：生成一个16:9宽屏横屏{gen_word}（16:9 widescreen landscape video，时长严格为 {dur} 秒）")
         else:
-            parts.append(f"全新文生视频创作（纯文本全新生成，严禁参考任何历史图片或上下文）：生成一个16:9横屏宽屏视频（16:9 widescreen landscape video，时长严格为 {dur} 秒）：{user_prompt}")
+            parts.append(f"全新文生视频创作（纯文本全新生成，严禁参考任何历史图片或上下文）：生成一个16:9横屏宽屏视频（16:9 widescreen landscape video，时长严格为 {dur} 秒）")
     else:
         if has_ref:
-            parts.append(f"{reference_instruction}：生成动态{gen_word}（时长严格为 {dur} 秒）：{user_prompt}")
+            parts.append(f"{reference_instruction}：生成动态{gen_word}（时长严格为 {dur} 秒）")
         else:
-            parts.append(f"全新文生视频创作（纯文本全新生成，严禁参考任何历史图片或上下文）：生成一个视频（时长严格为 {dur} 秒）：{user_prompt}")
+            parts.append(f"全新文生视频创作（纯文本全新生成，严禁参考任何历史图片或上下文）：生成一个视频（时长严格为 {dur} 秒）")
 
     if r.resolution:
         parts.append(f"画质规格：{r.resolution}")
     if r.extra:
-        parts.append(r.extra)
-    parts.append(VIDEO_OUTPUT_CONTRACT)
-    return "，".join(parts)
+        parts.append(f"补充要求：{r.extra}")
+    return ("【视频规格与素材】\n" + "\n".join(parts)
+            + "\n\n【原始画面与声音要求】\n" + user_prompt
+            + "\n\n【执行与交付】\n画面动作与台词/画外音分别理解；保留原台词和每项素材的用途。\n"
+            + VIDEO_OUTPUT_CONTRACT)
 
 
 def media_url(name: str) -> str:
@@ -1168,7 +1169,13 @@ def _run_generation(prompt: str, kind: str, timeout: int,
         GEN_LOCK.release()
 
 
+class MuseVideoRevisionRequired(MuseModelRefusalError):
+    """The diagnosis requires a content change that only the user can approve."""
+
+
 def _video_error_code(exc: Exception) -> str:
+    if isinstance(exc, MuseVideoRevisionRequired):
+        return "video_revision_required"
     if isinstance(exc, MuseTextOnlyError):
         return "video_text_only"
     if isinstance(exc, MuseModelRefusalError):
@@ -1212,6 +1219,7 @@ def _run_video_generation(prompt: str, timeout: int, account: dict,
     elif len(refs) > 1:
         engine_kwargs["reference_images"] = refs
 
+    attempt_prompt = prompt
     for attempt in range(1 + retry_limit):
         remaining = int(deadline - time.monotonic())
         if attempt and remaining < VIDEO_RETRY_MIN_SECONDS:
@@ -1226,7 +1234,6 @@ def _run_video_generation(prompt: str, timeout: int, account: dict,
             on_attempt({"attempts": attempt + 1, "retry_count": attempt,
                         "retry_reason": "video_text_only" if attempt else None,
                         "stage": "retrying" if attempt else "waiting_media", "error_code": None})
-        attempt_prompt = prompt if not attempt else prompt + "\n\n" + VIDEO_OUTPUT_CONTRACT
         try:
             result = engine.generate(account["cookies"], attempt_prompt, expect="video",
                                      timeout=remaining, expires=account.get("cookies_exp"),
@@ -1235,6 +1242,45 @@ def _run_video_generation(prompt: str, timeout: int, account: dict,
         except MuseTextOnlyError:
             if attempt >= retry_limit:
                 raise
+            # Diagnosis runs in the first attempt's page, with the same account
+            # and browser lock. It must finish before a fresh generation starts.
+            diagnostic_budget = min(VIDEO_DIAGNOSTIC_MAX_SECONDS,
+                                    int(deadline - time.monotonic()) - VIDEO_RETRY_MIN_SECONDS)
+            if diagnostic_budget <= 0:
+                if on_attempt:
+                    on_attempt({"attempts": 1, "retry_count": 0,
+                                "retry_reason": "insufficient_deadline", "stage": "failed",
+                                "error_code": "video_text_only", "diagnostic_status": "skipped",
+                                "diagnostic_summary": "剩余时限不足以诊断并保留 120 秒生成时间。"})
+                raise MuseTextOnlyError("上次仅返回文字，剩余总时限不足以诊断并保留 120 秒，未执行自动重试")
+            if on_attempt:
+                on_attempt({"attempts": 1, "retry_count": 0, "retry_reason": "video_text_only",
+                            "stage": "retrying", "diagnostic_status": "running"})
+            try:
+                diagnostic_text = engine.diagnose_video_failure(
+                    build_diagnostic_prompt(prompt), timeout=diagnostic_budget)
+                # The engine contract is completed text only. Wrong types or
+                # empty/partial output cannot establish that the turn ended.
+                if not isinstance(diagnostic_text, str) or not diagnostic_text.strip():
+                    raise MuseGenerationError("诊断未返回完整文字")
+            except Exception as exc:
+                if on_attempt:
+                    on_attempt({"diagnostic_status": "failed", "diagnostic_decision": "unknown",
+                                "diagnostic_summary": "诊断状态未确认，未执行自动重试。"})
+                raise MuseGenerationError("视频诊断状态未确认，已停止自动重试，请核对上游任务状态") from exc
+            plan = parse_diagnostic(diagnostic_text)
+            retry_prompt = build_retry_prompt(prompt, plan) if plan.decision == "retry_same_content" else None
+            if on_attempt:
+                on_attempt({"diagnostic_status": plan.status, "diagnostic_decision": plan.decision,
+                            "diagnostic_summary": plan.summary,
+                            "diagnostic_reply": diagnostic_text[:MAX_DIAGNOSTIC_CHARS], "retry_prompt": retry_prompt})
+            if plan.decision == "blocked":
+                raise MuseModelRefusalError(plan.summary)
+            if plan.decision == "needs_user_change":
+                raise MuseVideoRevisionRequired("视频需调整原要求，未自动重试：" + plan.summary)
+            if plan.decision != "retry_same_content":
+                raise MuseTextOnlyError(plan.summary)
+            attempt_prompt = retry_prompt
             continue
         store.mark(account["id"], True, "")
         _sync_cookies(account["id"])
@@ -1614,7 +1660,9 @@ async def create_video(req: VideoRequest, _=Depends(auth)):
     timeout = req.timeout or CFG.video_timeout
     task = store.create_task("video", req.prompt)
     store.update_task(task["id"], api_prompt=prompt, attempts=0, retry_count=0,
-                      retry_reason=None, stage="queued", error_code=None)
+                      retry_reason=None, stage="queued", error_code=None,
+                      diagnostic_status="not_requested", diagnostic_summary=None,
+                      diagnostic_decision=None, diagnostic_reply=None, retry_prompt=None)
 
     store.update_task(task["id"], progress=10)
 
@@ -3044,7 +3092,14 @@ async def admin_repo_push(payload: dict = Body(default={}), _=Depends(auth)):
 async def _startup():
     for task in list(store.tasks.values()):
         if task.get("kind") in ("image", "video") and task.get("status") in ("queued", "processing"):
-            store.update_task(task["id"], status="failed", error="服务重启中断了任务，请重新提交")
+            metadata = {"status": "failed", "error": "服务重启中断了任务，请重新提交"}
+            if task.get("kind") == "video":
+                metadata.update(stage="failed", error_code="generation_unknown",
+                                error="服务重启中断了视频任务，请核对上游状态后再处理")
+                if task.get("diagnostic_status") == "running":
+                    metadata.update(diagnostic_status="failed", diagnostic_decision="unknown",
+                                    diagnostic_summary="诊断被服务重启中断，未确认上游状态，未自动重试。")
+            store.update_task(task["id"], **metadata)
     if not CFG.api_key:
         import secrets
         new_key = "m2a_" + secrets.token_hex(24)

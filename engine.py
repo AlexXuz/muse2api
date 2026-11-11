@@ -714,11 +714,16 @@ class MuseEngine:
         if page is not None and page.js(self._WORKSPACE_UNAVAILABLE_JS) is True:
             raise MuseWorkspaceUnavailableError()
 
-    def _wait_ws_ready(self, page: CDP, timeout: float = 15.0) -> bool:
+    def _wait_ws_ready(self, page: CDP, timeout: float = 15.0, *,
+                       io_deadline: float | None = None, stop_event=None) -> bool:
         """等待 muse.ai 页面完成 React hydration 且不再处于 Connecting... 状态。"""
         deadline = time.time() + timeout
         ready_since = None
         while time.time() < deadline:
+            if stop_event is not None and stop_event.is_set():
+                raise MuseGenerationError("诊断已取消")
+            if io_deadline is not None and time.monotonic() >= io_deadline:
+                raise MuseGenerationError("诊断等待超时")
             try:
                 self._raise_if_workspace_unavailable(page)
                 st = page.js("""(function(){
@@ -744,8 +749,10 @@ class MuseEngine:
             except MuseWorkspaceUnavailableError:
                 raise
             except Exception:
+                if io_deadline is not None:
+                    raise
                 ready_since = None
-            time.sleep(0.1)
+            time.sleep(min(0.1, max(0.0, io_deadline - time.monotonic())) if io_deadline is not None else 0.1)
         return False
 
     def reset_thread(self, for_chat: bool = False):
@@ -1175,11 +1182,31 @@ class MuseEngine:
         "return JSON.stringify({v:ta?ta.value:'',btn:b?(b.disabled?2:1):0});})()"
     )
 
-    def _send(self, prompt: str):
+    def _send(self, prompt: str, *, deadline: float | None = None, stop_event=None, before_submit=None):
+        send_page = self.page
+        def check_budget():
+            if deadline is not None and self.page is not send_page:
+                raise MuseGenerationError("诊断期间页面已变化，未发送后续操作")
+            if stop_event is not None and stop_event.is_set():
+                raise MuseGenerationError("诊断已取消")
+            if deadline is not None and time.monotonic() >= deadline:
+                raise MuseGenerationError("诊断等待超时")
+
+        def pause(seconds):
+            check_budget()
+            time.sleep(min(seconds, max(0.0, deadline - time.monotonic())) if deadline is not None else seconds)
+            check_budget()
+
+        check_budget()
         # Check again after navigation/attachment work; never retry a submitted prompt.
         self._raise_if_workspace_unavailable()
-        if not self.page or not self._wait_ws_ready(self.page, timeout=8.0):
+        check_budget()
+        ready = self.page and (self._wait_ws_ready(self.page, timeout=8.0) if deadline is None else
+            self._wait_ws_ready(self.page, timeout=min(8.0, max(0.0, deadline - time.monotonic())),
+                                io_deadline=deadline, stop_event=stop_event))
+        if not ready:
             raise MuseGenerationError("聊天输入框尚未准备完成，已停止发送，请稍后重试")
+        check_budget()
         # 1. 确保 textarea 滚动到视口中央并获得真实焦点
         try:
             self.page.js("""(function(){
@@ -1190,23 +1217,27 @@ class MuseEngine:
                 }
             })()""")
         except Exception:
+            if deadline is not None:
+                raise
             pass
-        time.sleep(0.1)
+        pause(0.1)
 
         rect = self.page.js(
             "(function(){var t=document.querySelector('textarea');if(!t)return null;"
             "var r=t.getBoundingClientRect();"
             "return JSON.stringify({x:Math.round(r.left+r.width/2),"
             "y:Math.round(r.top+r.height/2)});})()")
+        check_budget()
         if not rect:
             self._raise_if_workspace_unavailable()
             raise MuseGenerationError("找不到聊天输入框")
         c = json.loads(rect)
         for t in ("mousePressed", "mouseReleased"):
+            check_budget()
             self.page.send("Input.dispatchMouseEvent",
                            {"type": t, "x": c["x"], "y": c["y"],
                             "button": "left", "clickCount": 1})
-        time.sleep(0.1)
+        pause(0.1)
 
         # 触发 React 18 原型 setter 以及 input/change 事件以同步发送按钮状态
         # （对于 DeepSeek/Codex 等 100KB+ 超长上下文，直接走原型 setter 仅需 <1s，避免 Input.insertText 逐字注入卡死）
@@ -1221,6 +1252,7 @@ class MuseEngine:
             "return (ta.value||'').length;})(%s)")
         val_len = self.page.js(_SETTER_JS % json.dumps(prompt)) or 0
         if not val_len and len(prompt) < 500:
+            check_budget()
             self.page.send("Input.insertText", {"text": prompt})
             self.page.js(_SETTER_JS % json.dumps(prompt))
 
@@ -1228,6 +1260,10 @@ class MuseEngine:
         clicked = "no-button"
         t_deadline = time.time() + 3.0
         while time.time() < t_deadline:
+            check_budget()
+            if before_submit is not None:
+                before_submit()
+                check_budget()
             res = self.page.js(
                 "(function(){var b=[...document.querySelectorAll('button,[role=button]')]"
                 ".filter(function(x){return x.offsetParent!==null;})"
@@ -1240,12 +1276,15 @@ class MuseEngine:
             if res == "clicked":
                 clicked = "clicked"
                 break
-            time.sleep(0.08)
+            pause(0.08)
 
         if clicked != "clicked":
+            if deadline is not None:
+                raise MuseGenerationError("诊断发送按钮未确认，未执行键盘补发")
             # 兜底：Ctrl+Enter 或普通 Enter
             for combo in ({"modifiers": 1}, {}):
                 for t in ("keyDown", "char", "keyUp"):
+                    check_budget()
                     params = {"type": t, "key": "Enter", "code": "Enter",
                               "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13,
                               "modifiers": combo.get("modifiers", 0)}
@@ -1253,14 +1292,15 @@ class MuseEngine:
                         params["text"] = "\r"
                         params["unmodifiedText"] = "\r"
                     self.page.send("Input.dispatchKeyEvent", params)
-                time.sleep(1.0)
+                pause(1.0)
                 try:
                     if self.page.js("!(document.querySelector('textarea')||{value:''}).value"):
                         clicked = "enter-sent"
                         break
                 except Exception:
                     pass
-        time.sleep(0.3)
+        pause(0.3)
+        check_budget()
         return clicked
 
     # ---------------- 等待生成 ----------------
@@ -1658,6 +1698,19 @@ class MuseEngine:
         "return JSON.stringify({cnt:nonEmpty.length,total:bs.length,txt:txt,stop:stop});})()"
     )
 
+    _VIDEO_DIAGNOSIS_JS = """(() => {
+        const bubbles = [...document.querySelectorAll('div[class*="hatch-chat-groupable-bubble"]')]
+            .filter(el => /hatch-agent-bubble-bg/.test(el.className || ''));
+        const stop = !!(document.querySelector('[data-testid="hatch-composer-stop-button"]')
+            || document.querySelector('button[aria-label*="Stop" i]')
+            || document.querySelector('button[aria-label*="停止"]'));
+        const cards = [...document.querySelectorAll('[data-testid^="hatch-chat-attachment-presentation-"]')]
+            .filter(el => !el.closest('form, [class*=chat-user-bubble], [class*="group/msg"]')).length;
+        return JSON.stringify({cnt: bubbles.length,
+            txt: bubbles.length ? (bubbles[bubbles.length - 1].innerText || '').trim() : '',
+            stop, cards, attachments: JSON.parse(%s), path: location.pathname, origin: location.origin});
+    })()""" % _ATT_JS
+
     def _agent_text(self) -> str:
         """最后一个助手气泡的文本（取不到就返回空串）。"""
         try:
@@ -1694,6 +1747,83 @@ class MuseEngine:
         except Exception:
             pass
         return 0, "", False
+
+    def diagnose_video_failure(self, prompt: str, timeout: float = 45, stop_event=None) -> str:
+        """Ask once on the failed page; only return a confirmed, complete new reply.
+
+        The caller must retain the worker/account lease and prohibit media in its
+        prompt. Page checks cannot disable the upstream agent's media tools.
+        """
+        page = self.page
+        if page is None or not isinstance(prompt, str) or not prompt.strip():
+            raise MuseGenerationError("诊断缺少原失败页面或诊断问题")
+        if not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
+            raise MuseGenerationError("诊断等待时限无效")
+        deadline = time.monotonic() + min(45.0, timeout)
+
+        def remaining():
+            if self.page is not page:
+                raise MuseGenerationError("诊断期间页面已变化，未确认原任务状态")
+            if stop_event is not None and stop_event.is_set():
+                raise MuseGenerationError("诊断已取消")
+            value = deadline - time.monotonic()
+            if value <= 0:
+                raise MuseGenerationError("诊断等待超时，未确认回复完成")
+            return value
+
+        def snapshot(expected_path=None, expected_origin=None):
+            raw = page.js(self._VIDEO_DIAGNOSIS_JS, timeout=remaining())
+            remaining()
+            state = json.loads(raw)
+            if (not isinstance(state, dict) or type(state.get("cnt")) is not int or state["cnt"] < 0
+                    or not isinstance(state.get("txt"), str) or type(state.get("stop")) is not bool
+                    or type(state.get("cards")) is not int or state["cards"] < 0
+                    or not isinstance(state.get("attachments"), list)
+                    or any(not isinstance(item, dict) for item in state["attachments"])
+                    or not isinstance(state.get("path"), str) or not state["path"].startswith("/")
+                    or not isinstance(state.get("origin"), str) or not state["origin"] or state["origin"] == "null"):
+                raise MuseGenerationError("诊断页面状态读取无效")
+            if expected_path is not None and state["path"] != expected_path:
+                raise MuseGenerationError("诊断期间会话路径已变化，未确认原任务状态")
+            if expected_origin is not None and state["origin"] != expected_origin:
+                raise MuseGenerationError("诊断期间页面来源已变化，未确认原任务状态")
+            if state["cards"] or state["attachments"]:
+                raise MuseGenerationError("诊断期间发现媒体或封面，已停止自动重试")
+            return state
+
+        try:
+            with page.bounded_io(deadline):
+                before = snapshot()
+                if before["stop"] or not before["cnt"] or not before["txt"].strip():
+                    raise MuseGenerationError("原失败回复尚未确认结束，未发送诊断问题")
+                def before_submit():
+                    current = snapshot(before["path"], before["origin"])
+                    if current["stop"] or (current["cnt"], current["txt"]) != (before["cnt"], before["txt"]):
+                        raise MuseGenerationError("原任务状态在诊断发送前变化，未发送诊断问题")
+                if self._send(prompt, deadline=deadline, stop_event=stop_event, before_submit=before_submit) != "clicked":
+                    raise MuseGenerationError("诊断问题发送未确认，已停止等待")
+                remaining()
+                seen_stop = False
+                stable_key, stable_since = None, None
+                while True:
+                    state = snapshot(before["path"], before["origin"])
+                    seen_stop = seen_stop or state["stop"]
+                    if state["cnt"] < before["cnt"]:
+                        raise MuseGenerationError("诊断期间原会话消息已变化")
+                    if state["cnt"] > before["cnt"] and state["txt"].strip() and seen_stop and not state["stop"]:
+                        key = (state["cnt"], state["txt"])
+                        if key != stable_key:
+                            stable_key, stable_since = key, time.monotonic()
+                        elif time.monotonic() - stable_since >= 1.2:
+                            remaining()
+                            return state["txt"].strip()
+                    else:
+                        stable_key, stable_since = None, None
+                    time.sleep(min(0.2, remaining()))
+        except MuseGenerationError:
+            raise
+        except Exception as exc:
+            raise MuseGenerationError("诊断页面读取失败，未确认回复完成") from exc
 
     def chat_stream(self, cookies: dict, prompt: str, expires: dict | None = None,
                     timeout: int | None = None, account_id: str | None = None,
